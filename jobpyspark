@@ -1,0 +1,1462 @@
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import functions as F
+from pyspark.sql.functions import broadcast
+from pyspark.sql.window import Window
+import uuid
+from datetime import datetime
+import boto3
+import sys
+
+
+def job_provisiones():
+
+    # ─────────────────────────────────────────────────────────────
+    # CREAR CONTEXTOS SPARK Y GLUE
+    # ─────────────────────────────────────────────────────────────
+    sc          = SparkContext.getOrCreate()
+    glueContext = GlueContext(sc)
+    spark       = glueContext.spark_session
+
+    # ─────────────────────────────────────────────────────────────
+    # CONFIGURACIONES DE OPTIMIZACIÓN DE SPARK (obligatorias)
+    # ─────────────────────────────────────────────────────────────
+    try:
+        spark.conf.set("spark.sql.adaptive.enabled",                          "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled",       "true")
+        spark.conf.set("spark.sql.adaptive.skewJoin.enabled",                 "true")
+        spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled",       "true")
+        spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes",     "134217728")
+        spark.conf.set("spark.sql.shuffle.partitions",                        "120")
+        spark.conf.set("spark.sql.files.maxPartitionBytes",                   "134217728")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold",                "104857600")
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.threshold",  "32")
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.parallelism","32")
+        spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch",        "10000")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled",           "true")
+        spark.conf.set("spark.sql.adaptive.maxNumPostShufflePartitions",      "120")
+        print(" Configuraciones de Spark optimizadas aplicadas")
+    except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+        print(f" Advertencia: No se pudieron aplicar algunas configuraciones: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────
+    # CONFIGURACIÓN (obligatoria)
+    # ─────────────────────────────────────────────────────────────
+    args            = getResolvedOptions(sys.argv, ["environment", "P_PERIODO", "P_PERIODO_ANT"])
+    var_env         = args["environment"]
+    connection_name = f"cdata-bocc-{var_env}-glue-db-catalog-redshift"
+    temp_dir        = f"s3://cdata-bocc-{var_env}-output/aplicaciones/apl_cdata/salida/qualtrics/"
+
+    P_PERIODO     = args["P_PERIODO"]       # ej: '202501'
+    P_PERIODO_ANT = args["P_PERIODO_ANT"]   # ej: '202412'
+
+    # Trazabilidad de ejecución
+    execution_id  = str(uuid.uuid4())
+    fecha_inicio  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"Ejecución ID : {execution_id}")
+    print(f"Fecha inicio : {fecha_inicio}")
+    print(f"Ambiente     : {var_env}")
+    print(f"Período ACT  : {P_PERIODO}")
+    print(f"Período ANT  : {P_PERIODO_ANT}")
+
+    # ─────────────────────────────────────────────────────────────
+    # HELPER: leer desde Redshift
+    # ─────────────────────────────────────────────────────────────
+    def leer_redshift(query: str):
+        return glueContext.create_dynamic_frame_from_options(
+            connection_type="redshift",
+            connection_options={
+                "connectionName"         : connection_name,
+                "query"                  : query,
+                "redshiftTmpDir"         : temp_dir,
+                "useConnectionProperties": True,
+            },
+        ).toDF()
+
+    # ═════════════════════════════════════════════════════════════
+    # FASE 1 — UNION BASE ANT + ACT
+    # ═════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"[FASE 1] UNION BASE | ANT: {P_PERIODO_ANT} | ACT: {P_PERIODO}")
+    print(f"{'='*60}")
+
+    ## desde aqui la modificación
+    ## modifique la consulta: campos calculados no consistente con propuesta en athena
+    def get_query_pecontable(periodo, act_only):
+        """
+        Query liviana — solo columnas base desde Redshift.
+        RANGOS_MORA, LINEA_CREDITO, IFRS_COLGAAP se calculan en Spark.
+        """
+        campos_act_only = ""
+        if act_only:
+            campos_act_only = ",\n                PE.STROBLMODALIDAD"
+
+        return f"""
+            SELECT
+                -- CLAVES JOIN
+                PE.STRCLINIT,
+                PE.STROBLOBLIGSARC,
+
+                -- IDENTIFICACIÓN
+                PE.STRANOMES,
+                PE.STRPETIPOCREDITO,
+                PE.NUMPEPROCODIGO,
+                PE.NUMTIPOCONCEPTO,
+                PE.STRPECONCEPTO,
+                PE.NUMPIMATRIZ_B,
+                PE.STRPECALIFICACION,
+                PE.STRCALIFHOMOLOGADA,
+                PE.STRCALIFICACIONTEMP,
+                PE.STRCALIFICACIONREF,
+                PE.STRPEMAXGARANTIA,
+                PE.NUMPETIPOGARANTIA,
+                PE.NUMPDIMR    AS PDI,
+                PE.NUMVALORGAR AS VALOR_GAR,
+                PE.NUMCLITIPOEMP AS TIPO_EMPRESA,
+                PE.NUMDIASVENC   AS DIAS_MORA,
+
+                -- SALDOS BASE
+                PE.NUMPEEDIK,
+                PE.NUMPEEDII,
+                PE.NUMPEEDIKOTROS,
+
+                -- PROVISIONES BASE
+                PE.NUMPEDIFK,
+                PE.NUMPEDIFI,
+                PE.NUMDIFCAPOTROS,
+                PE.NUMPEANTICICLICADIFCAPITAL,
+                PE.NUMPEANTICICLICADIFINTERES,
+                PE.NUMPEANTICICLICADIFOTROS,
+                PE.NUMPECONTABLEK,
+                PE.NUMPECONTABLEI,
+                PE.NUMCAPOTROS,
+                PE.NUMPEANTICICLICACAPITAL,
+                PE.NUMPEANTICICLICAINTERES,
+                PE.NUMPEANTICICLICAOTROS,
+
+                -- PROVISIONES HISTÓRICAS BASE
+                PE.NUM_PE_DIF_K_ACU,
+                PE.NUM_PE_DIF_I_ACU,
+                PE.NUM_DIF_KOTROS_ACU,
+                PE.NUM_PE_CIC_DIF_K_ACU,
+                PE.NUM_PE_CIC_DIF_I_ACU,
+                PE.NUM_PE_CIC_DIF_KOTROS_ACU,
+                PE.NUM_PE_K_ACU,
+                PE.NUM_PE_I_ACU,
+                PE.NUM_KOTROS_ACU,
+                PE.NUM_PE_CIC_K_ACU,
+                PE.NUM_PE_CIC_I_ACU,
+                PE.NUM_PE_CIC_KOTROS_ACU,
+                PE.NUM_PE_CIC_K_DES,
+                PE.NUM_PE_CIC_I_DES,
+                PE.NUM_PE_CIC_KOTROS_DES
+                {campos_act_only}
+            FROM ADMSARC.TBLPECONTABLE PE
+            WHERE PE.STRANOMES = '{periodo}'
+        """.strip()
+
+    ## desde aqui modificar las lineas de campos calculados
+    def calcular_campos_spark(df):
+        """
+        Calcula en Spark los campos derivados que antes iban en la query SQL.
+        Más eficiente para 186M registros — no sobrecarga Redshift.
+        """
+        return (
+            df
+            # TIPO_CREDITO
+            .withColumn("TIPO_CREDITO",
+                F.when(F.col("STRPETIPOCREDITO") == "1", "COMERCIAL")
+                 .when(F.col("STRPETIPOCREDITO") == "2", "CONSUMO")
+                 .when(F.col("STRPETIPOCREDITO") == "3", "HIPOTECARIO")
+            )
+
+            # RANGOS_MORA
+            .withColumn("RANGOS_MORA",
+                # CONSUMO
+                F.when((F.col("STRPETIPOCREDITO") == "2") & F.col("DIAS_MORA").between(0,   30),  "0 - 30")
+                 .when((F.col("STRPETIPOCREDITO") == "2") & F.col("DIAS_MORA").between(31,  60),  "31 - 60")
+                 .when((F.col("STRPETIPOCREDITO") == "2") & F.col("DIAS_MORA").between(61,  90),  "61 - 90")
+                 .when((F.col("STRPETIPOCREDITO") == "2") & F.col("DIAS_MORA").between(91, 180),  "91 - 180")
+                 .when((F.col("STRPETIPOCREDITO") == "2") & (F.col("DIAS_MORA") > 180),           "MAYOR A 180")
+                 # COMERCIAL
+                 .when((F.col("STRPETIPOCREDITO") == "1") & F.col("DIAS_MORA").between(0,   30),  "0 - 30")
+                 .when((F.col("STRPETIPOCREDITO") == "1") & F.col("DIAS_MORA").between(31,  90),  "31 - 90")
+                 .when((F.col("STRPETIPOCREDITO") == "1") & F.col("DIAS_MORA").between(91, 180),  "91 - 180")
+                 .when((F.col("STRPETIPOCREDITO") == "1") & F.col("DIAS_MORA").between(181, 360), "181 - 360")
+                 .when((F.col("STRPETIPOCREDITO") == "1") & (F.col("DIAS_MORA") > 360),           "MAYOR A 360")
+                 # HIPOTECARIO
+                 .when((F.col("STRPETIPOCREDITO") == "3") & F.col("DIAS_MORA").between(0,   30),  "0 - 30")
+                 .when((F.col("STRPETIPOCREDITO") == "3") & F.col("DIAS_MORA").between(31, 120),  "31 - 120")
+                 .when((F.col("STRPETIPOCREDITO") == "3") & F.col("DIAS_MORA").between(121, 180), "121 - 180")
+                 .when((F.col("STRPETIPOCREDITO") == "3") & F.col("DIAS_MORA").between(181, 360), "181 - 360")
+                 .when((F.col("STRPETIPOCREDITO") == "3") & F.col("DIAS_MORA").between(360, 540), "361 - 540")
+                 .when((F.col("STRPETIPOCREDITO") == "3") & (F.col("DIAS_MORA") > 540),           "MAYOR A 540")
+                 .otherwise(F.lit(None))
+            )
+
+            # LINEA_CREDITO y LINEA_CREDITO_2 (misma lógica)
+            .withColumn("LINEA_CREDITO",
+                F.when(F.col("NUMPEPROCODIGO") == 1,  "CARTERA_ORDINARIA")
+                 .when(F.col("NUMPEPROCODIGO") == 4,  "MONEDA EXTRAJERA")
+                 .when(F.col("NUMPEPROCODIGO") == 16, "SEGUROS")
+                 .when(F.col("NUMPEPROCODIGO") == 18, "TESORERIA")
+                 .when(F.col("NUMPEPROCODIGO").isin(83, 84, 85), "OPERACIONES LEASING")
+                 .when(F.col("NUMPEPROCODIGO").isin(44, 82), "LEASING FINANCIERO")
+                 .when(F.col("NUMPEPROCODIGO") == 81, "LEASING OPERATIVO")
+                 .when(F.col("NUMPEPROCODIGO") == 24, "EMPLEADOS")
+                 .when(F.col("NUMPEPROCODIGO") == 54, "LIBRANZA")
+                 .when(F.col("NUMPEPROCODIGO") == 51, "VEHICULOS Y MOTOS")
+                 .when(F.col("NUMPEPROCODIGO") == 3,  "SOBREGIRO")
+                 .when(F.col("NUMPEPROCODIGO") == 5,  "PRESTAMO_PERSONAL")
+                 .when(F.col("NUMPEPROCODIGO").isin(6, 7, 38, 56), "TARJETA CREDITO")
+                 .when(F.col("NUMPEPROCODIGO").isin(9, 10), "ACEPTACIONES BANCARIAS")
+                 .when(F.col("NUMPEPROCODIGO") == 32, "OTROS DEUDORES")
+                 .when(F.col("NUMPEPROCODIGO") == 40, "FACTORING")
+                 .when(F.col("NUMPEPROCODIGO") == 49, "LEASING HABITACIONAL")
+                 .when(F.col("NUMPEPROCODIGO") == 45, "LEASING OPERATIVO")
+                 .when(F.col("NUMPEPROCODIGO") == 43, "VIVIENDA")
+                 .otherwise("OTROS")
+            )
+            .withColumn("LINEA_CREDITO_2", F.col("LINEA_CREDITO"))
+
+            # IFRS_COLGAAP
+            .withColumn("IFRS_COLGAAP",
+                F.when(F.col("NUMPEPROCODIGO").isin(81, 82, 83, 84, 85, 9, 10), "IFRS")
+                 .when(F.col("NUMPEPROCODIGO") == 45, "COLGAAP")
+                 .otherwise("IFRS Y COLGAAP")
+            )
+
+            # SALDOS calculados
+            .withColumn("SALDO_K",
+                F.when(F.col("NUMTIPOCONCEPTO") == 3, F.lit(0))
+                 .otherwise(F.coalesce(F.col("NUMPEEDIK"), F.lit(0))))
+            .withColumn("SALDO_I",
+                F.when(F.col("NUMTIPOCONCEPTO") == 3, F.lit(0))
+                 .otherwise(F.coalesce(F.col("NUMPEEDII"), F.lit(0))))
+            .withColumn("SALDO_O",
+                F.when(F.col("NUMTIPOCONCEPTO") == 3, F.lit(0))
+                 .otherwise(F.coalesce(F.col("NUMPEEDIKOTROS"), F.lit(0))))
+            .withColumn("SALDO_TOTAL",
+                F.when(F.col("NUMTIPOCONCEPTO") == 3, F.lit(0))
+                 .otherwise(F.coalesce(
+                     F.col("NUMPEEDIK") + F.col("NUMPEEDII") + F.col("NUMPEEDIKOTROS"),
+                     F.lit(0))))
+
+            # PROVISIONES calculadas
+            .withColumn("PROV_DIF_PRO_K", F.col("NUMPEDIFK"))
+            .withColumn("PROV_DIF_ANT_K", F.col("NUMPEANTICICLICADIFCAPITAL"))
+            .withColumn("PROV_DIF_K",     F.col("NUMPEDIFK") + F.col("NUMPEANTICICLICADIFCAPITAL"))
+            .withColumn("PROV_DIF_PRO_I", F.col("NUMPEDIFI"))
+            .withColumn("PROV_DIF_ANT_I", F.col("NUMPEANTICICLICADIFINTERES"))
+            .withColumn("PROV_DIF_I",     F.col("NUMPEDIFI") + F.col("NUMPEANTICICLICADIFINTERES"))
+            .withColumn("PROV_DIF_PRO_OT",F.col("NUMDIFCAPOTROS"))
+            .withColumn("PROV_DIF_ANT_OT",F.col("NUMPEANTICICLICADIFOTROS"))
+            .withColumn("PROV_DIF_O",     F.col("NUMDIFCAPOTROS") + F.col("NUMPEANTICICLICADIFOTROS"))
+            .withColumn("PROV_DIF",
+                F.col("NUMPEDIFK") + F.col("NUMPEDIFI") + F.col("NUMDIFCAPOTROS") +
+                F.col("NUMPEANTICICLICADIFCAPITAL") + F.col("NUMPEANTICICLICADIFINTERES") +
+                F.col("NUMPEANTICICLICADIFOTROS"))
+            .withColumn("PROV_ACUM_PRO_K", F.col("NUMPECONTABLEK"))
+            .withColumn("PROV_ACUM_ANT_K", F.col("NUMPEANTICICLICACAPITAL"))
+            .withColumn("PROV_ACUM_K",     F.col("NUMPECONTABLEK") + F.col("NUMPEANTICICLICACAPITAL"))
+            .withColumn("PROV_ACUM_PRO_I", F.col("NUMPECONTABLEI"))
+            .withColumn("PROV_ACUM_ANT_I", F.col("NUMPEANTICICLICAINTERES"))
+            .withColumn("PROV_ACUM_I",     F.col("NUMPECONTABLEI") + F.col("NUMPEANTICICLICAINTERES"))
+            .withColumn("PROV_ACUM_PRO_OT",F.col("NUMCAPOTROS"))
+            .withColumn("PROV_ACUM_ANT_OT",F.col("NUMPEANTICICLICAOTROS"))
+            .withColumn("PROV_ACUM_O",     F.col("NUMCAPOTROS") + F.col("NUMPEANTICICLICAOTROS"))
+            .withColumn("PROV_ACUM",
+                F.col("NUMPECONTABLEK") + F.col("NUMPECONTABLEI") + F.col("NUMCAPOTROS") +
+                F.col("NUMPEANTICICLICACAPITAL") + F.col("NUMPEANTICICLICAINTERES") +
+                F.col("NUMPEANTICICLICAOTROS"))
+
+            # PROVISIONES HISTÓRICAS calculadas
+            .withColumn("PROV_DIF_ACUM",
+                F.col("NUM_PE_DIF_K_ACU") + F.col("NUM_PE_DIF_I_ACU") +
+                F.col("NUM_DIF_KOTROS_ACU") + F.col("NUM_PE_CIC_DIF_K_ACU") +
+                F.col("NUM_PE_CIC_DIF_I_ACU") + F.col("NUM_PE_CIC_DIF_KOTROS_ACU"))
+            .withColumn("PROV_ACUM_ACUM",
+                F.col("NUM_PE_K_ACU") + F.col("NUM_PE_I_ACU") + F.col("NUM_KOTROS_ACU") +
+                F.col("NUM_PE_CIC_K_ACU") + F.col("NUM_PE_CIC_I_ACU") +
+                F.col("NUM_PE_CIC_KOTROS_ACU"))
+            .withColumn("PROV_DESACUM_CIC",
+                F.col("NUM_PE_CIC_K_DES") + F.col("NUM_PE_CIC_I_DES") +
+                F.col("NUM_PE_CIC_KOTROS_DES"))
+
+            # Elimine columnas base (ya no se necesitan)
+            .drop(
+                "STRPETIPOCREDITO",
+                "NUMPEEDIK", "NUMPEEDII", "NUMPEEDIKOTROS",
+                "NUMPEDIFK", "NUMPEDIFI", "NUMDIFCAPOTROS",
+                "NUMPEANTICICLICADIFCAPITAL", "NUMPEANTICICLICADIFINTERES",
+                "NUMPEANTICICLICADIFOTROS", "NUMPECONTABLEK", "NUMPECONTABLEI",
+                "NUMCAPOTROS", "NUMPEANTICICLICACAPITAL", "NUMPEANTICICLICAINTERES",
+                "NUMPEANTICICLICAOTROS", "NUM_PE_DIF_K_ACU", "NUM_PE_DIF_I_ACU",
+                "NUM_DIF_KOTROS_ACU", "NUM_PE_CIC_DIF_K_ACU", "NUM_PE_CIC_DIF_I_ACU",
+                "NUM_PE_CIC_DIF_KOTROS_ACU", "NUM_PE_K_ACU", "NUM_PE_I_ACU",
+                "NUM_KOTROS_ACU", "NUM_PE_CIC_K_ACU", "NUM_PE_CIC_I_ACU",
+                "NUM_PE_CIC_KOTROS_ACU", "NUM_PE_CIC_K_DES", "NUM_PE_CIC_I_DES",
+                "NUM_PE_CIC_KOTROS_DES"
+            )
+        )
+
+    df_ant = calcular_campos_spark(leer_redshift(get_query_pecontable(P_PERIODO_ANT, act_only=False)))
+    df_act = calcular_campos_spark(leer_redshift(get_query_pecontable(P_PERIODO,     act_only=True)))
+    print(f"[FASE 1] TBLPECONTABLE ANT: {df_ant.count():,} | ACT: {df_act.count():,}")
+
+    # Renombrar con sufijos
+    join_keys = ["STRCLINIT", "STROBLOBLIGSARC"]
+
+    join_keys_lower = {k.lower() for k in join_keys}
+
+    # Para df_ant
+    for c in df_ant.columns:
+        if c.lower() not in join_keys_lower:
+            df_ant = df_ant.withColumnRenamed(c, f"{c}_ANT")
+
+    # Para df_act
+    for c in df_act.columns:
+        if c.lower() not in join_keys_lower:
+            df_act = df_act.withColumnRenamed(c, f"{c}_ACT")
+
+    df_comparativo = (
+        df_ant.alias("ant")
+        .join(df_act.alias("act"), on=join_keys, how="full_outer")
+        .withColumn(
+            "DIFERENCIAL_ACUM",
+            F.when(F.col("NUMTIPOCONCEPTO_ACT").isNull(), F.lit(0))
+             .otherwise(F.col("PROV_ACUM_ACUM_ANT") - F.col("PROV_ACUM_ACUM_ACT"))
+        )
+        .filter(F.col("NUMPEPROCODIGO_ACT") != 45)
+    )
+    print(f"[FASE 1]  df_comparativo: {df_comparativo.count():,} registros")
+
+
+job_provisiones()
+
+---------------------------------------------------------------------------------------------------------
+
+
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import functions as F
+from pyspark.sql.functions import broadcast
+from pyspark.sql.window import Window
+import uuid
+from datetime import datetime
+import boto3
+import sys
+
+
+def job_qualtrics_test():
+    # ─────────────────────────────────────────────
+    # CREAR CONTEXTOS SPARK Y GLUE
+    # ─────────────────────────────────────────────
+    sc          = SparkContext.getOrCreate()
+    glueContext = GlueContext(sc)
+    spark       = glueContext.spark_session
+    # ─────────────────────────────────────────────
+    # CONFIGURACIONES DE OPTIMIZACIÓN DE SPARK (obligatorias)
+    # ─────────────────────────────────────────────
+    try:
+        spark.conf.set("spark.sql.adaptive.enabled",                          "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled",       "true")
+        spark.conf.set("spark.sql.adaptive.skewJoin.enabled",                 "true")
+        spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled",       "true")
+        spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes",     "134217728")
+        spark.conf.set("spark.sql.shuffle.partitions",                        "120")
+        spark.conf.set("spark.sql.files.maxPartitionBytes",                   "134217728")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold",                "104857600")
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.threshold",  "32")
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.parallelism","32")
+        spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch",        "10000")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled",           "true")
+        spark.conf.set("spark.sql.adaptive.maxNumPostShufflePartitions",      "120")
+        print(" Configuraciones de Spark optimizadas aplicadas")
+    except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+        print(f" Advertencia: No se pudieron aplicar algunas configuraciones: {str(e)}")
+        
+    # ─────────────────────────────────────────────
+    # CONFIGURACIÓN
+    # ─────────────────────────────────────────────
+    
+    args = getResolvedOptions(sys.argv, ["environment"])
+    var_env         = args["environment"]
+    connection_name = f"cdata-bocc-{var_env}-glue-db-catalog-redshift"
+    temp_dir        = f"s3://cdata-bocc-{var_env}-output/aplicaciones/apl_cdata/salida/qualtrics/"
+    
+    # -------------------------
+    # Helpers de formato
+    # -------------------------
+    def proper_case(col):
+        return F.concat(F.upper(F.substring(col, 1, 1)), F.lower(F.substring(col, 2, 1000)))
+
+    def collapse_spaces(col):
+        return F.regexp_replace(F.trim(col), r"\s+", " ")
+
+    def build_fullname(first_col, last_col, maiden_col):
+        full = collapse_spaces(F.concat_ws(" ",
+            F.coalesce(first, F.lit("")),
+            F.coalesce(last, F.lit("")),
+            F.coalesce(maiden, F.lit(""))
+        ))
+        return proper_case(full)
+
+    def clean_city_desc(desc_col):
+        cleaned = collapse_spaces(F.regexp_replace(desc_col, r"\.+\s*$", ""))
+        return proper_case(cleaned)
+    
+    # ─────────────────────────────────────────────
+    # HELPER: leer desde Redshift
+    # ─────────────────────────────────────────────
+    def leer_redshift(query: str):
+        return glueContext.create_dynamic_frame_from_options(
+            connection_type="redshift",
+            connection_options={
+                "connectionName"         : connection_name,
+                "query"                  : query,
+                "redshiftTmpDir"         : temp_dir,
+                "useConnectionProperties": True,
+            },
+        ).toDF()    
+     
+     
+    # ───────────────────────────────────────────── 
+    # 1) FUNCIÓN PARA QUERY PN BASE LIGHT
+    # ─────────────────────────────────────────────
+
+    def get_query_pn_base_light():
+        """
+        Devuelve el SQL para PN_BASE_LIGHT.
+        """
+        return """
+        SELECT
+          c.ROW_ID                                AS ROW_ID_CLIENTE,
+          c.X_OCS_ID_NUM                          AS NUMERO_DE_DOCUMENTO,
+          c.X_OCS_ID_TYPE                         AS TIPO_DOC_NAME,
+          c.FST_NAME                              AS C_FST_NAME,
+          c.LAST_NAME                             AS C_LAST_NAME,
+          c.MAIDEN_NAME                           AS C_MAIDEN_NAME,
+          c.PR_PER_ADDR_ID,
+          c.PR_PHONE_ID,
+          c.PR_POSTN_ID,
+          pcon.POSTN_ID,
+          postn.OU_ID                             AS ORG_ID,
+          org.LOC                                 AS COD_DIVISION_GERENTE,
+          org.NAME                                AS ORG_NAME,
+          postn.NAME                              AS POSTN_NAME,
+          emp.ROW_ID                              AS GERENTE_ROW_ID,
+          emp.EMP_NUM                             AS CODIGO_SAP_GERENTE,
+          emp.FST_NAME                            AS G_FST_NAME,
+          emp.LAST_NAME                           AS G_LAST_NAME,
+          emp.MAIDEN_NAME                         AS G_MAIDEN_NAME,
+          conx.ATTRIB_39                          AS TIPO_ATENCION_NAME,
+          per.ADDR                                AS DIRECCION,
+          per.CITY                                AS CITY_VAL,
+          fnxm.ATTRIB_49                          AS SEGMENTO_NAME,
+          fnxm.ATTRIB_50                          AS SEGMENTO_FLAG,
+          catalog.DETAIL_TYPE_CD                  AS CLASE_PRODUCTO_VAL
+        FROM ADMSIEBEL.S_POSTN_CON pcon
+        JOIN ADMSIEBEL.S_POSTN postn          ON pcon.POSTN_ID = postn.ROW_ID
+        JOIN ADMSIEBEL.S_CONTACT c            ON pcon.CON_ID = c.ROW_ID
+        JOIN ADMSIEBEL.S_ORG_EXT org          ON postn.OU_ID = org.ROW_ID
+        JOIN ADMSIEBEL.S_CONTACT emp          ON postn.PR_EMP_ID = emp.ROW_ID
+        JOIN ADMSIEBEL.S_EMPLOYEE_X t7        ON t7.PAR_ROW_ID = emp.ROW_ID
+        LEFT JOIN ADMSIEBEL.S_CONTACT_X conx  ON conx.PAR_ROW_ID = c.ROW_ID
+        LEFT JOIN ADMSIEBEL.S_ADDR_PER per    ON per.ROW_ID = c.PR_PER_ADDR_ID
+        JOIN ADMSIEBEL.S_ASSET_CON rel        ON rel.CONTACT_ID = c.ROW_ID
+        JOIN ADMSIEBEL.S_ASSET prod           ON rel.ASSET_ID = prod.ROW_ID
+        JOIN ADMSIEBEL.S_PROD_INT catalog     ON prod.PROD_ID = catalog.ROW_ID
+        JOIN ADMSIEBEL.S_CONTACT_FNXM fnxm    ON c.ROW_ID = fnxm.PAR_ROW_ID
+        WHERE c.PR_POSTN_ID = pcon.POSTN_ID
+          AND fnxm.ATTRIB_50 = '1000001'
+          AND org.NAME <> 'DIRECCION  ONBOARDING Y ASIGNACION'
+          AND postn.NAME <> 'Siebel Administrator'
+          AND prod.STATUS_CD IN ('1010000')
+          AND rel.RELATION_TYPE_CD IN ('Deudor','Titular principal producto')
+        """.strip()
+    
+    # Ejecutar la lectura
+    query_PN_BASE_LIGHT = get_query_pn_base_light()
+    PN_base = leer_redshift(query_PN_BASE_LIGHT)
+ 
+
+    # ─────────────────────────────────────────────
+    # PHONES LIGHT
+    # ─────────────────────────────────────────────
+    query_PHONES_LIGHT = """
+        SELECT
+          p.CON_ID         AS ORG_ID,
+          p.ROW_ID         AS PHONE_ROW_ID,
+          p.X_OCS_PHONE_NUM,
+          p.X_OCS_EXTENSION,
+          p.X_OCS_END_DATE
+        FROM ADMSIEBEL.S_CON_PHONE p
+        WHERE p.X_OCS_END_DATE IS NULL
+    """.strip()
+    
+    phones_raw = leer_redshift(query_PHONES_LIGHT)
+    
+    print("phones_raw:", phones_raw.count())
+  
+    
+    # ─────────────────────────────────────────────
+    # LOVs
+    # ─────────────────────────────────────────────
+
+    q_lov_multi = """
+    SELECT TYPE AS TYPE_NAME, NAME, VAL, HIGH, DESC_TEXT
+    FROM ADMSIEBEL.S_LST_OF_VAL
+    WHERE TYPE IN (
+      'OCS_NID_TYPES',
+      'OCS_SEGMENT',
+      'OCS_CITY',
+      'FINCORP_PROD_ADMIN_CLASS_MLOV',
+      'OCS_ATTENTION_TYPE'
+    )
+    AND ACTIVE_FLG = 'Y'
+    """.strip()
+
+    lov_all = leer_redshift(q_lov_multi) \
+    .withColumnRenamed("NAME", "LOV_NAME") \
+    .withColumnRenamed("VAL", "LOV_VAL") \
+    .withColumnRenamed("HIGH", "LOV_HIGH") \
+    .withColumnRenamed("DESC_TEXT", "LOV_DESC")
+
+
+    # Particionarlo en 5 DataFrames según el TYPE (en Spark)
+    lov_nid     = lov_all.filter(F.col("TYPE_NAME") == "OCS_NID_TYPES"                 ).select("LOV_NAME","LOV_HIGH")
+    lov_segment = lov_all.filter(F.col("TYPE_NAME") == "OCS_SEGMENT"                   ).select("LOV_NAME","LOV_DESC")
+    lov_city    = lov_all.filter(F.col("TYPE_NAME") == "OCS_CITY"                      ).select("LOV_VAL","LOV_DESC")
+    lov_prod    = lov_all.filter(F.col("TYPE_NAME") == "FINCORP_PROD_ADMIN_CLASS_MLOV").select("LOV_VAL","LOV_DESC")
+    lov_att     = lov_all.filter(F.col("TYPE_NAME") == "OCS_ATTENTION_TYPE"            ).select("LOV_NAME","LOV_DESC")
+    print("lov_all:", lov_all.count())
+    
+    # ─────────────────────────────────────────────
+    # Enriquecimiento PN con LOVs y formatos
+    # ─────────────────────────────────────────────
+
+    PN_enriched = (  
+    PN_base
+        # Tipo de documento: join por NAME → exponer HIGH
+        .join(
+            broadcast(lov_nid).alias("lv_nid"),
+            F.col("TIPO_DOC_NAME") == F.col("lv_nid.LOV_NAME"),
+            "left"
+        )
+        .withColumn("TIPO_DE_DOCUMENTO_COD", F.col("lv_nid.LOV_HIGH"))
+
+        # Segmento: join por NAME → exponer DESC
+        .join(
+            broadcast(lov_segment).alias("lv_seg"),
+            F.col("SEGMENTO_NAME") == F.col("lv_seg.LOV_NAME"),
+            "left"
+        )
+        .withColumn("SEGMENTO_COMERCIAL_CLIENTE", F.col("lv_seg.LOV_DESC"))
+
+        # Tipo de atención: join por NAME → exponer DESC
+        .join(
+            broadcast(lov_att).alias("lv_att"),
+            F.col("TIPO_ATENCION_NAME") == F.col("lv_att.LOV_NAME"),
+            "left"
+        )
+        .withColumn("TIPO_ATENCION_DESC", F.col("lv_att.LOV_DESC"))
+
+        # Ciudad: join por VAL → exponer DESC (limpiando formato)
+        .join(
+            broadcast(lov_city).alias("lv_city"),
+            F.col("CITY_VAL") == F.col("lv_city.LOV_VAL"),
+            "left"
+        )
+        .withColumn("CIUDAD_DESC", clean_city_desc(F.col("lv_city.LOV_DESC")))
+
+        # Clase producto: join por VAL → exponer DESC
+        .join(
+            broadcast(lov_prod).alias("lv_prod"),
+            F.col("CLASE_PRODUCTO_VAL") == F.col("lv_prod.LOV_VAL"), 
+            "left"
+        )
+        .withColumn("CLASE_PRODUCTO_DESC", F.col("lv_prod.LOV_DESC
+
+
+        # Nombres formateados (cliente y gerente)
+        .withColumn(
+            "NOMBRE_CLIENTE",
+            build_fullname(F.col("C_FST_NAME"), F.col("C_LAST_NAME"), F.col("C_MAIDEN_NAME"))  
+        )
+        .withColumn(
+            "NOMBRE_GERENTE",
+            build_fullname(F.col("G_FST_NAME"), F.col("G_LAST_NAME"), F.col("G_MAIDEN_NAME"))
+
+
+        # Filtro de segmentos válidos (igual que tu SQL)
+        .filter(F.col("SEGMENTO_COMERCIAL_CLIENTE").isin(
+            'BP - Selecto','BP - Preferente Plus','BP - Elite Plus',
+            'BP - Masivo','BP - Mi Grupo es Aval','BP - Preferente','BP - Elite'
+        ))
+
+        # Selección para continuar con teléfonos y clases
+        .select(
+            "ROW_ID_CLIENTE","NUMERO_DE_DOCUMENTO",
+            "TIPO_DE_DOCUMENTO_COD",
+            "NOMBRE_CLIENTE",
+            "COD_DIVISION_GERENTE",
+            "NOMBRE_GERENTE",
+            "CODIGO_SAP_GERENTE",
+            F.col("SEGMENTO_COMERCIAL_CLIENTE").alias("SEGMENTO"),
+            F.col("TIPO_ATENCION_DESC").alias("TIPO_ATENCION"),
+            "DIRECCION",
+            F.col("CIUDAD_DESC").alias("CIUDAD"),
+            F.col("CLASE_PRODUCTO_DESC").alias("CLASE_PRODUCTO"),
+            "PR_PHONE_ID"
+        )
+    )
+    
+    # ─────────────────────────────────────────────
+    # TELÉFONOS: agregación por cliente + LEFT JOIN (sin perder clientes)
+    # ─────────────────────────────────────────────
+    ##PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
+    ##phones_raw  = phones_raw.repartition(120, "ORG_ID")
+
+    phones_pre = (
+        phones_raw.alias("p")
+        .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
+        .withColumn("EXT_TRIM",       F.trim(F.col("p.X_OCS_EXTENSION")))
+        .filter(F.col("PHONE_NUM_TRIM").isNotNull() & (F.length(F.col("PHONE_NUM_TRIM")) > 0))
+        .withColumn(
+            "PHONE_FORMAT",
+            F.concat(
+                F.col("PHONE_NUM_TRIM"),
+                F.when(
+                    F.col("EXT_TRIM").isNotNull() & (F.length(F.col("EXT_TRIM")) > 0), 
+                    F.concat(F.lit("|"), F.col("EXT_TRIM"))
+                ).otherwise(F.lit(""))
+            )
+        )
+        .withColumn("PHONE_ORDER", F.col("PHONE_NUM_TRIM")) 
+    )
+
+    pn_keys = PN_enriched.select("ROW_ID_CLIENTE", "PR_PHONE_ID").distinct()
+    pn_keys = broadcast(pn_keys)
+
+    phones_labeled = (
+        phones_pre.alias("p")
+        .join(
+            pn_keys.alias("c"),
+            F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"),
+            "left"
+        )
+        .withColumn(
+            "PHONE_FORMAT",
+            F.when(
+                F.col("p.PHONE_ROW_ID") == F.col("c.PR_PHONE_ID"),
+                F.concat(F.lit("P-"), F.col("PHONE_FORMAT"))
+            ).otherwise(F.col("PHONE_FORMAT"))
+        )
+    )
+
+    phones_agg = (
+        phones_labeled
+        .groupBy("ORG_ID")
+        .agg(
+            F.expr("""
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('k', PHONE_ORDER, 'v', PHONE_FORMAT))),
+                        x -> x.v
+                    ),
+                    ', '
+                )
+            """).alias("TELEFONOS")
+        )
+    )
+
+    PN_with_phones = (
+        PN_enriched.alias("pn")
+        .join(
+            phones_agg.alias("ph"),
+            F.col("pn.ROW_ID_CLIENTE") == F.col("ph.ORG_ID"),
+            "left"
+        )
+        .drop("ORG_ID")
+    )
+    
+    # -------------------------
+    # CLASES_PRODUCTO (LISTAGG) 
+    # -------------------------
+
+    # 1) deduplicamos primero por las columnas clave
+    ## REVISARLO
+    classes_uniq = PN_enriched.dropDuplicates([
+        "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+        "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+        "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD","CLASE_PRODUCTO"
+    ])
+
+    # 2) Agregamos clases de producto por cliente (ordenadas, sin duplicados, separadas por coma)
+    classes_agg_client = (
+        classes_uniq
+        .groupBy(
+            "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+            "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+            "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD"
+        )
+        .agg(
+            F.array_join(
+                F.array_sort(F.array_distinct(F.collect_list(F.col("CLASE_PRODUCTO")))),
+                F.lit(", ")
+            ).alias("CLASES_PRODUCTO")
+        )
+    )
+
+    # 3) Teléfonos formateados (del bloque previo): phones_agg ya tiene ORG_ID y TELEFONOS
+    #    Para que tu join funcione como lo escribiste, aliasamos phones_agg como phones_fmt
+    phones_fmt = phones_agg.alias("p")
+
+    # 4) Resultado final (estilo de tu compañera: selección con alias legibles y orden por CLIENTE)
+    PN_df = (
+        classes_agg_client.alias("c")
+        .join(phones_fmt, F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"), "left")
+        .select(
+            F.col("c.SEGMENTO").alias("SEGMENTO"),
+            F.col("c.TIPO_DE_DOCUMENTO_COD").alias("TIPO DE DOCUMENTO"),
+            F.col("c.NUMERO_DE_DOCUMENTO").alias("IDENT"),
+            F.col("c.NOMBRE_CLIENTE").alias("CLIENTE"),
+            F.col("c.TIPO_ATENCION").alias("CAPA"),
+            F.col("c.COD_DIVISION_GERENTE").alias("CODIGO ZONAL"),
+            F.col("c.CODIGO_SAP_GERENTE").alias("CODIGO SAP GERENTE"),
+            F.col("c.NOMBRE_GERENTE").alias("NOMBRE_GERENTE"),
+            F.col("c.CLASES_PRODUCTO").alias("PRODUCTO"),
+            F.col("p.TELEFONOS").alias("TELEFONOS"),
+            F.col("c.DIRECCION").alias("DIRECCION"),
+            F.col("c.CIUDAD").alias("CIUDAD")
+        )
+        .orderBy(F.col("CLIENTE").asc())
+    )
+
+
+
+    job_qualtrics_test()
+    -------------------------------------------------------------------------------------------------------
+
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import functions as F
+from pyspark.sql.functions import broadcast
+from pyspark.sql.window import Window
+from datetime import datetime
+from pyspark.sql.utils import AnalysisException
+import sys
+
+def job_pn_leyes():
+    # -------------------------
+    # CONTEXTOS
+    # -------------------------
+    sc = SparkContext.getOrCreate()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+
+    # -------------------------
+    # OPTIMIZACIÓN SPARK
+    # -------------------------
+    try:
+        spark.conf.set("spark.sql.adaptive.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.localShuffleReader.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "134217728")
+        spark.conf.set("spark.sql.shuffle.partitions", "120")
+        spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "104857600")  # 100MB
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.threshold", "32")
+        spark.conf.set("spark.sql.sources.parallelPartitionDiscovery.parallelism", "32")
+        spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.maxNumPostShufflePartitions", "120")
+        spark.conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        print("Configuraciones de Spark optimizadas aplicadas")
+        except (AnalysisException, RuntimeError, OSError, ValueError) as e:
+        print(f"Advertencia: No se pudieron aplicar algunas configuraciones: {str(e)}")
+        
+       
+        
+        
+    from repo.src.job_libranza_saldlib import job_libranza_saldlib
+    import sys
+    from awsglue.utils import getResolvedOptions
+    if __name__ == "__main__":
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "environment"])
+    env = args["environment"]
+    job_name = args["JOB_NAME"].replace("-", "_")
+    job_name = job_name.replace(f"cdata_bocc_{env}_", "")
+    job_functions = {
+        "job_libranza_saldlib": job_libranza_saldlib,
+    }
+    if job_name in job_functions:
+        job_functions[job_name]()
+    else:
+        print(f"Job '{job_name}' especificado, no ha sido encontrado.")    
+        
+
+    # -------------------------
+    # CONFIGURACIÓN
+    # -------------------------
+    args = getResolvedOptions(sys.argv, ["environment"])
+    var_env = args["environment"]
+
+    connection_name = f"cdata-bocc-{var_env}-glue-db-catalog-redshift"
+    temp_dir = f"s3://cdata-bocc-{var_env}-output/aplicaciones/apl_cdata/salida/qualtrics/"
+
+    # -------------------------
+    # 1) PN BASE LIGHT
+    # -------------------------
+    query_PN_BASE_LIGHT = """
+    SELECT
+      c.ROW_ID                                AS ROW_ID_CLIENTE,
+      c.X_OCS_ID_NUM                          AS NUMERO_DE_DOCUMENTO,
+      c.X_OCS_ID_TYPE                         AS TIPO_DOC_NAME,
+      c.FST_NAME                              AS C_FST_NAME,
+      c.LAST_NAME                             AS C_LAST_NAME,
+      c.MAIDEN_NAME                           AS C_MAIDEN_NAME,
+      c.PR_PER_ADDR_ID,
+      c.PR_PHONE_ID,
+      c.PR_POSTN_ID,
+      pcon.POSTN_ID,
+      postn.OU_ID                             AS ORG_ID,
+      org.LOC                                 AS COD_DIVISION_GERENTE,
+      org.NAME                                AS ORG_NAME,
+      postn.NAME                              AS POSTN_NAME,
+      emp.ROW_ID                              AS GERENTE_ROW_ID,
+      emp.EMP_NUM                             AS CODIGO_SAP_GERENTE,
+      emp.FST_NAME                            AS G_FST_NAME,
+      emp.LAST_NAME                           AS G_LAST_NAME,
+      emp.MAIDEN_NAME                         AS G_MAIDEN_NAME,
+      conx.ATTRIB_39                          AS TIPO_ATENCION_NAME,   -- LOV en Spark
+      per.ADDR                                AS DIRECCION,
+      per.CITY                                AS CITY_VAL,             -- LOV en Spark
+      fnxm.ATTRIB_49                          AS SEGMENTO_NAME,        -- LOV en Spark
+      fnxm.ATTRIB_50                          AS SEGMENTO_FLAG,
+      catalog.DETAIL_TYPE_CD                  AS CLASE_PRODUCTO_VAL    -- LOV en Spark
+    FROM ADMSIEBELS_POSTN_CON pcon
+    JOIN ADMSIEBELS_POSTN postn                ON pcon.POSTN_ID = postn.ROW_ID
+    JOIN ADMSIEBELS_CONTACT c                  ON pcon.CON_ID = c.ROW_ID
+    JOIN ADMSIEBELS_ORG_EXT org                ON postn.OU_ID = org.ROW_ID
+    JOIN ADMSIEBELS_CONTACT emp                ON postn.PR_EMP_ID = emp.ROW_ID
+    JOIN ADMSIEBELS_EMPLOYEE_X t7              ON t7.PAR_ROW_ID = emp.ROW_ID
+    LEFT JOIN ADMSIEBELS_CONTACT_X conx        ON conx.PAR_ROW_ID = c.ROW_ID
+    LEFT JOIN ADMSIEBELS_ADDR_PER per          ON per.ROW_ID = c.PR_PER_ADDR_ID
+    JOIN ADMSIEBELS_ASSET_CON rel              ON rel.CONTACT_ID = c.ROW_ID
+    JOIN ADMSIEBELS_ASSET prod                 ON rel.ASSET_ID = prod.ROW_ID
+    JOIN ADMSIEBELS_PROD_INT catalog           ON prod.PROD_ID = catalog.ROW_ID
+    JOIN ADMSIEBELS_CONTACT_FNXM fnxm          ON c.ROW_ID = fnxm.PAR_ROW_ID
+    WHERE c.PR_POSTN_ID = pcon.POSTN_ID
+      AND fnxm.ATTRIB_50 = '1000001'  -- solo segmentos comerciales
+      AND org.NAME <> 'DIRECCION  ONBOARDING Y ASIGNACION'
+      AND postn.NAME <> 'Siebel Administrator'
+      AND prod.STATUS_CD IN ('1010000')
+      AND rel.RELATION_TYPE_CD IN ('Deudor','Titular principal producto')
+    """.strip()
+
+    PN_base = glueContext.create_dynamic_frame_from_options(
+        connection_type="redshift",
+        connection_options={
+            "connectionName": connection_name,
+            "query": query_PN_BASE_LIGHT,
+            "redshiftTmpDir": temp_dir,
+            "useConnectionProperties": True,
+        },
+    ).toDF()
+    
+    print("PN_base:", PN_base.count())
+    
+    # -------------------------
+    # PHONES LIGHT
+    # -------------------------
+    query_PHONES_LIGHT = """
+    SELECT
+      p.CON_ID         AS ORG_ID,
+      p.ROW_ID         AS PHONE_ROW_ID,
+      p.X_OCS_PHONE_NUM,
+      p.X_OCS_EXTENSION,
+      p.X_OCS_END_DATE
+    FROM ADMSIEBEL.S_CON_PHONE p
+    WHERE p.X_OCS_END_DATE IS NULL
+    """.strip()
+
+    phones_raw = glueContext.create_dynamic_frame_from_options(
+        connection_type="redshift",
+        connection_options={
+            "connectionName": connection_name,
+            "query": query_PHONES_LIGHT,
+            "redshiftTmpDir": temp_dir,
+            "useConnectionProperties": True,
+        },
+    ).toDF()
+    print("phones_raw:", phones_raw.count())
+    
+    
+    # 1) Prepara columnas base (limpieza y formato)
+    phones_pre = (
+        phones_raw.alias("p")
+        # Normaliza número y extensión
+        .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
+        .withColumn("EXT_TRIM", F.trim(F.col("p.X_OCS_EXTENSION")))
+        # Evita filas con número vacío o nulo
+        .filter(F.col("PHONE_NUM_TRIM").isNotNull() & (F.length(F.col("PHONE_NUM_TRIM")) > 0))
+        # Texto base: "<numero>|<ext>" si hay ext
+        .withColumn(
+            "PHONE_FORMAT_BASE",
+            F.concat(
+                F.col("PHONE_NUM_TRIM"),
+                F.when(
+                    F.col("EXT_TRIM").isNotNull() & (F.length(F.col("EXT_TRIM")) > 0),
+                    F.concat(F.lit("|"), F.col("EXT_TRIM"))
+                ).otherwise(F.lit(""))
+            )
+        )
+        # Clave de orden alfabética/numérica por el número
+        .withColumn("PHONE_ORDER", F.col("PHONE_NUM_TRIM"))
+    )
+
+    # 2) Trae las llaves de PN para identificar el teléfono primario
+    pn_keys = PN_enriched.select("ROW_ID_CLIENTE", "PR_PHONE_ID").distinct()
+    # Si pn_keys es pequeño, acelera con broadcast
+    pn_keys = broadcast(pn_keys)
+
+    # 3) Marca primarios y construye el formato final (P- al primario)
+    phones_labeled = (
+        phones_pre.alias("p")
+        .join(
+            pn_keys.alias("c"),
+            F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"),
+            "left"  # importante: no perder teléfonos “huérfanos” si existieran
+        )
+        .withColumn("IS_PRIMARY", F.col("p.PHONE_ROW_ID") == F.col("c.PR_PHONE_ID"))
+        .withColumn(
+            "PHONE_FORMAT",
+            F.when(F.col("IS_PRIMARY"), F.concat(F.lit("P-"), F.col("PHONE_FORMAT_BASE")))
+             .otherwise(F.col("PHONE_FORMAT_BASE"))
+        )
+    )
+
+    # 4) (Opcional) Deduplicar por cliente+formato, por si hay duplicados exactos
+    phones_labeled = phones_labeled.dropDuplicates(["ORG_ID", "PHONE_FORMAT"])
+
+    # 5) Agregar por cliente con orden: primarios primero, luego por número
+    phones_agg = (
+        phones_labeled
+        .withColumn("ORD_PRIMARY", F.when(F.col("IS_PRIMARY"), F.lit(0)).otherwise(F.lit(1)))
+        .groupBy("ORG_ID")
+        .agg(
+            F.expr("""
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('k1', ORD_PRIMARY, 'k2', PHONE_ORDER, 'fmt', PHONE_FORMAT))),
+                        x -> x.fmt
+                    ),
+                    ', '
+                )
+            """).alias("TELEFONOS")
+        )
+    )
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    # -------------------------
+    # LOVs
+    # -------------------------
+    def read_lov(type_name):
+        q = f"""
+        SELECT NAME, VAL, HIGH, DESC_TEXT
+        FROM ADMADMSIEBELS_LST_OF_VAL
+        WHERE TYPE = '{type_name}' AND ACTIVE_FLG = 'Y'
+        """
+        df_raw = glueContext.create_dynamic_frame_from_options(
+            connection_type="redshift",
+            connection_options={
+                "connectionName": connection_name,
+                "query": q,
+                "redshiftTmpDir": temp_dir,
+                "useConnectionProperties": True,
+            },
+        ).toDF()
+    print("df_raw:", df_raw.count())
+        # Renombres para evitar ambigüedades con 'VAL'
+        df = (
+            df_raw
+            .withColumnRenamed("NAME", "LOV_NAME")
+            .withColumnRenamed("VAL", "LOV_VAL")
+            .withColumnRenamed("HIGH", "LOV_HIGH")
+            .withColumnRenamed("DESC_TEXT", "LOV_DESC")
+        )
+        return df
+
+    lov_nid     = read_lov('OCS_NID_TYPES').select('LOV_NAME','LOV_HIGH')     # tipo doc (NAME→HIGH)
+    lov_segment = read_lov('OCS_SEGMENT').select('LOV_NAME','LOV_DESC')       # segmento (NAME→DESC)
+    lov_city    = read_lov('OCS_CITY').select('LOV_VAL','LOV_DESC')           # ciudad   (VAL→DESC)
+    lov_prod    = read_lov('FINCORP_PROD_ADMIN_CLASS_MLOV').select('LOV_VAL','LOV_DESC')  # clase prod (VAL→DESC)
+    lov_att     = read_lov('OCS_ATTENTION_TYPE').select('LOV_NAME','LOV_DESC')# tipo atención (NAME→DESC)
+
+
+    # -------------------------
+    # Helpers de formato
+    # -------------------------
+    def proper_case(col):
+        return F.concat(F.upper(F.substring(col, 1, 1)), F.lower(F.substring(col, 2, 1000)))
+
+    def collapse_spaces(col):
+        return F.regexp_replace(F.trim(col), r"\s+", " ")
+
+    def build_fullname(first, last, maiden):
+        full = collapse_spaces(F.concat_ws(" ",
+            F.coalesce(first, F.lit("")),
+            F.coalesce(last, F.lit("")),
+            F.coalesce(maiden, F.lit(""))
+        ))
+        return proper_case(full)
+
+    def clean_city_desc(desc_col):
+        cleaned = collapse_spaces(F.regexp_replace(desc_col, r"\.+\s*$", ""))
+        return proper_case(cleaned)
+
+    # -------------------------
+    # Enriquecimiento PN con LOVs y formatos
+    # -------------------------
+    PN_enriched = (
+        PN_base
+        # Tipo de documento: join por NAME → exponer HIGH
+        .join(broadcast(lov_nid).alias("lv_nid"),
+              PN_base.TIPO_DOC_NAME == F.col("lv_nid.LOV_NAME"), "left")
+        .withColumn("TIPO_DE_DOCUMENTO_COD", F.col("lv_nid.LOV_HIGH"))
+
+        # Segmento: join por NAME → exponer DESC
+        .join(broadcast(lov_segment).alias("lv_seg"),
+              PN_base.SEGMENTO_NAME == F.col("lv_seg.LOV_NAME"), "left")
+        .withColumn("SEGMENTO_COMERCIAL_CLIENTE", F.col("lv_seg.LOV_DESC"))
+
+        # Tipo de atención: join por NAME → exponer DESC
+        .join(broadcast(lov_att).alias("lv_att"),
+              PN_base.TIPO_ATENCION_NAME == F.col("lv_att.LOV_NAME"), "left")
+        .withColumn("TIPO_ATENCION_DESC", F.col("lv_att.LOV_DESC"))
+
+        # Ciudad: join por VAL → exponer DESC (limpiando formato)
+        .join(broadcast(lov_city).alias("lv_city"),
+              PN_base.CITY_VAL == F.col("lv_city.LOV_VAL"), "left")
+        .withColumn("CIUDAD_DESC", clean_city_desc(F.col("lv_city.LOV_DESC")))
+
+        # Clase producto: join por VAL → exponer DESC
+        .join(broadcast(lov_prod).alias("lv_prod"),
+              PN_base.CLASE_PRODUCTO_VAL == F.col("lv_prod.LOV_VAL"), "left")
+        .withColumn("CLASE_PRODUCTO_DESC", F.col("lv_prod.LOV_DESC"))
+
+        # Nombres formateados (cliente y gerente)
+        .withColumn("NOMBRE_CLIENTE", build_fullname("C_FST_NAME","C_LAST_NAME","C_MAIDEN_NAME"))
+        .withColumn("NOMBRE_GERENTE", build_fullname("G_FST_NAME","G_LAST_NAME","G_MAIDEN_NAME"))
+
+        # Filtro de segmentos válidos (igual que tu SQL)
+        .filter(F.col("SEGMENTO_COMERCIAL_CLIENTE").isin(
+            'BP - Selecto','BP - Preferente Plus','BP - Elite Plus',
+            'BP - Masivo','BP - Mi Grupo es Aval','BP - Preferente','BP - Elite'
+        ))
+
+        # Selección para continuar con teléfonos y clases
+        .select(
+            "ROW_ID_CLIENTE","NUMERO_DE_DOCUMENTO",
+            "TIPO_DE_DOCUMENTO_COD",
+            "NOMBRE_CLIENTE",
+            "COD_DIVISION_GERENTE",
+            "NOMBRE_GERENTE",
+            "CODIGO_SAP_GERENTE",
+            F.col("SEGMENTO_COMERCIAL_CLIENTE").alias("SEGMENTO"),
+            F.col("TIPO_ATENCION_DESC").alias("TIPO_ATENCION"),
+            "DIRECCION",
+            F.col("CIUDAD_DESC").alias("CIUDAD"),
+            F.col("CLASE_PRODUCTO_DESC").alias("CLASE_PRODUCTO"),
+            "PR_PHONE_ID"
+        )
+    )
+
+    # -------------------------
+    # TELÉFONOS (LISTAGG ordenado)
+    # -------------------------
+    PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
+
+    phones_fmt = (
+        phones_raw.alias("p")
+        .join(
+            PN_enriched.select("ROW_ID_CLIENTE","PR_PHONE_ID").alias("c"),
+            F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"),
+            "right"
+        )
+        .withColumn("IS_PRIMARY", F.col("p.PHONE_ROW_ID") == F.col("c.PR_PHONE_ID"))
+        .withColumn("PHONE_ORDER", F.trim(F.col("p.X_OCS_PHONE_NUM")))
+        .withColumn(
+            "PHONE_FORMAT",
+            F.when(
+                F.col("IS_PRIMARY"),
+                F.concat(
+                    F.lit("P-"),
+                    F.trim(F.col("p.X_OCS_PHONE_NUM")),
+                    F.when(
+                        F.col("p.X_OCS_EXTENSION").isNotNull() & (F.length(F.trim(F.col("p.X_OCS_EXTENSION"))) > 0),
+                        F.concat(F.lit("|"), F.trim(F.col("p.X_OCS_EXTENSION")))
+                    ).otherwise(F.lit(""))
+                )
+            ).otherwise(
+                F.concat(
+                    F.trim(F.col("p.X_OCS_PHONE_NUM")),
+                    F.when(
+                        F.col("p.X_OCS_EXTENSION").isNotNull() & (F.length(F.trim(F.col("p.X_OCS_EXTENSION"))) > 0),
+                        F.concat(F.lit("|"), F.trim(F.col("p.X_OCS_EXTENSION")))
+                    ).otherwise(F.lit(""))
+                )
+            )
+        )
+        .dropDuplicates(["p.ORG_ID", "PHONE_FORMAT"])
+        .groupBy("p.ORG_ID")
+        .agg(
+            F.expr("""
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('ord', PHONE_ORDER, 'fmt', PHONE_FORMAT))),
+                        x -> x.fmt
+                    ),
+                    ', '
+                )
+            """).alias("TELEFONOS")
+        )
+    )
+
+    # -------------------------
+    # CLASES_PRODUCTO (LISTAGG)
+    # -------------------------
+    classes_uniq = PN_enriched.dropDuplicates([
+        "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+        "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+        "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD","CLASE_PRODUCTO"
+    ])
+
+    classes_agg_client = (
+        classes_uniq
+        .groupBy(
+            "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+            "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+            "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD"
+        )
+        .agg(
+            F.array_join(
+                F.array_sort(F.array_distinct(F.collect_list("CLASE_PRODUCTO"))),
+                F.lit(", ")
+            ).alias("CLASES_PRODUCTO")
+        )
+    )
+
+    PN_df = (
+        classes_agg_client.alias("c")
+        .join(phones_fmt.alias("p"), F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"), "left")
+        .select(
+            F.col("c.SEGMENTO").alias("SEGMENTO"),
+            F.col("c.TIPO_DE_DOCUMENTO_COD").alias("TIPO DE DOCUMENTO"),
+            F.col("c.NUMERO_DE_DOCUMENTO").alias("IDENT"),
+            F.col("c.NOMBRE_CLIENTE").alias("CLIENTE"),
+            F.col("c.TIPO_ATENCION").alias("CAPA"),
+            F.col("c.COD_DIVISION_GERENTE").alias("CODIGO ZONAL"),
+            F.col("c.CODIGO_SAP_GERENTE").alias("CODIGO SAP GERENTE"),
+            F.col("c.NOMBRE_GERENTE").alias("NOMBRE_GERENTE"),
+            F.col("c.CLASES_PRODUCTO").alias("PRODUCTO"),
+            F.col("p.TELEFONOS").alias("TELEFONOS"),
+            F.col("c.DIRECCION").alias("DIRECCION"),
+            F.col("c.CIUDAD").alias("CIUDAD")
+        )
+        .orderBy(F.col("CLIENTE").asc())
+    )
+
+    # ============================================================
+    # CONSENTIMIENTOS UNIFICADOS: LEY 1581 + LEY 2300 (Formulario)
+    # ============================================================
+
+    # ---- LECTURA 1581 ----
+    query_MDM1581 = """
+        SELECT
+            V.CONTENT AS CONTACTO,          -- canal equivalente en 1581
+            G.REF_NUM AS NUM_ID_CLIENTE,    -- documento
+            B.AGREE_IND,                    -- 0=no, 1=sí, 2=SC
+            B.CREATE_DATE AS FECHA_DILIG
+        FROM ADMMDM.CONTACT CT
+        INNER JOIN ADMMDM.IDENTIFIER G       ON CT.CONT_ID = G.CONT_ID
+        INNER JOIN ADMMDM.CONSENT B          ON B.CONSENT_OWNER_ID = G.CONT_ID
+        INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON B.PROC_PURP_ID = P.PROC_PURP_ID
+        INNER JOIN ADMMDM.CONSENTREGULATION CR ON B.PROC_PURP_ID = CR.PROC_PURP_ID 
+        INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON B.PROC_PURP_ID = PA.PROC_PURP_ID
+        INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON B.PROC_PURP_ID = PPTA.PROC_PURP_ID
+        LEFT  JOIN ADMMDM.CONSENTPROVISION  V ON B.CONSENT_ID = V.CONSENT_ID
+        WHERE 1 = 1
+          AND P.PROC_PURP_TP_CD = '1000002'    -- Comercial
+          AND REGULATION_TP_CD  = '1000001'    -- Ley 1581
+          AND PROC_ACT_TP_CD    = '1000001'
+          AND TENANT_TP_CD      = '1000007'
+          AND B.END_DT IS NULL
+          AND CT.INACTIVATED_DT IS NULL
+          AND G.END_DT IS NULL
+    """.strip()
+
+    MDM1581 = glueContext.create_dynamic_frame_from_options(
+        connection_type="redshift",
+        connection_options={
+            "connectionName": connection_name,
+            "query": query_MDM1581,
+            "redshiftTmpDir": temp_dir,
+            "useConnectionProperties": True,
+        },
+    ).toDF()
+    
+    
+    
+    
+    MDM1581 = (
+        MDM1581
+        .withColumn("doc_join",
+            F.regexp_replace(F.col("NUM_ID_CLIENTE").cast("string"), r"\s+", "")
+        )
+        .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
+        .withColumn("FECHA_DILIG_STR", F.col("FECHA_DILIG").cast("string"))
+        .withColumn(
+            "ts_1581",
+            F.coalesce(
+                F.to_timestamp("FECHA_DILIG_STR", "dd/MM/yy hh:mm:ss,SSSSSSSSS a"),
+                F.to_timestamp("FECHA_DILIG_STR", "dd/MM/yy hh:mm:ss a"),
+                F.to_timestamp("FECHA_DILIG_STR", "yyyy-MM-dd HH:mm:ss"),
+                F.to_timestamp("FECHA_DILIG_STR")
+            )
+        )
+        # 0 = NO contacto; 1/2 = permitido/otra categoría
+        .withColumn("agree_1581",
+            F.when(F.col("AGREE_IND").cast("int") == 0, F.lit(0)).otherwise(F.lit(1))
+        )
+    )
+
+    w1581 = Window.partitionBy("doc_join").orderBy(F.col("ts_1581").desc_nulls_last())
+    MDM1581_latest = (
+        MDM1581
+        .withColumn("rn", F.row_number().over(w1581))
+        .filter(F.col("rn") == 1)
+        .select(
+            F.lit("1581").alias("ley"),
+            "doc_join",
+            F.col("agree_1581").alias("agree"),
+            F.col("ts_1581").alias("ts"),
+            # Canal unificado: 1581 usa CONTACTO
+            F.col("CONTACTO").alias("canal_contacto")
+        )
+    )
+
+    # ---- LECTURA 2300 ----
+    query_LEY2300 = """
+        SELECT
+            I.ID_TP_CD                     AS TIPO_IDENTIFICACION,
+            I.REF_NUM                      AS NUMERO_DE_IDENTIFICACION,
+            C.CREATE_DATE                  AS FECHA_DE_INICIO,
+            CAST(C.AGREE_IND AS VARCHAR2(19)) AS AGREEIND,
+            C.END_DT                       AS FECHA_DE_FIN,
+            NVL(V.CONTENT,'-')             AS CANAL_DE_CONTACTO,
+            NVL(C.AUTH_CHNL_TP_CD,'1000000') AS TIPO_CANAL
+        FROM ADMMDM.CONTACT CT
+        INNER JOIN ADMMDM.IDENTIFIER I      ON CT.CONT_ID = I.CONT_ID
+        INNER JOIN ADMMDM.CONSENT     C     ON I.CONT_ID = C.CONSENT_OWNER_ID
+        INNER JOIN ADMMDM.CONSENTPROVISION V ON C.CONSENT_ID = V.CONSENT_ID
+        INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON C.PROC_PURP_ID = P.PROC_PURP_ID
+        INNER JOIN ADMMDM.CONSENTREGULATION CR ON C.PROC_PURP_ID = CR.PROC_PURP_ID 
+        INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON C.PROC_PURP_ID = PA.PROC_PURP_ID
+        INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON C.PROC_PURP_ID = PPTA.PROC_PURP_ID
+        WHERE 1 = 1
+          AND P.PROC_PURP_TP_CD = '1000002'   -- Comercial
+          AND REGULATION_TP_CD  = '1000003'   -- Ley 2300
+          AND PROC_ACT_TP_CD    = '1000001'
+          AND TENANT_TP_CD      = '1000007'
+          AND C.END_DT IS NULL
+          AND CT.INACTIVATED_DT IS NULL 
+          AND I.END_DT IS NULL
+    """.strip()
+
+    LEY2300 = glueContext.create_dynamic_frame_from_options(
+        connection_type="redshift",
+        connection_options={
+            "connectionName": connection_name,
+            "query": query_LEY2300,
+            "redshiftTmpDir": temp_dir,
+            "useConnectionProperties": True,
+        },
+    ).toDF()
+
+    LEY2300 = (
+        LEY2300
+        .withColumn("doc_join",
+            F.regexp_replace(F.col("NUMERO_DE_IDENTIFICACION").cast("string"), r"\s+", "")
+        )
+        .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
+        .withColumn("FECHA_INICIO_STR", F.col("FECHA_DE_INICIO").cast("string"))
+        .withColumn(
+            "ts_2300",
+            F.coalesce(
+                F.to_timestamp("FECHA_INICIO_STR", "dd/MM/yy hh:mm:ss,SSSSSSSSS a"),
+                F.to_timestamp("FECHA_INICIO_STR", "dd/MM/yy hh:mm:ss a"),
+                F.to_timestamp("FECHA_INICIO_STR", "yyyy-MM-dd HH:mm:ss"),
+                F.to_timestamp("FECHA_INICIO_STR")
+            )
+        )
+        .withColumn("agree_2300",
+            F.when(F.trim(F.col("AGREEIND")) == F.lit("0"), F.lit(0))
+             .when(F.trim(F.col("AGREEIND")) == F.lit("1"), F.lit(1))
+             .otherwise(F.col("AGREEIND").cast("int"))
+        )
+    )
+
+    w2300 = Window.partitionBy("doc_join").orderBy(F.col("ts_2300").desc_nulls_last())
+    LEY2300_latest = (
+        LEY2300
+        .withColumn("rn", F.row_number().over(w2300))
+        .filter(F.col("rn") == 1)
+        .select(
+            F.lit("2300").alias("ley"),
+            "doc_join",
+            F.col("agree_2300").alias("agree"),
+            F.col("ts_2300").alias("ts"),
+            # Canal unificado: 2300 usa CANAL_DE_CONTACTO
+            F.col("CANAL_DE_CONTACTO").alias("canal_contacto")
+        )
+    )
+
+    # ---- UNION de leyes y elección de la MÁS RECIENTE por documento ----
+    consent_candidates = MDM1581_latest.unionByName(LEY2300_latest)
+
+    # Empate por fecha (opcional): priorizar 2300 sobre 1581 si el timestamp es idéntico
+    consent_rank = Window.partitionBy("doc_join").orderBy(
+        F.col("ts").desc_nulls_last(),
+        F.when(F.col("ley") == "2300", F.lit(1)).otherwise(F.lit(0)).desc()
+    )
+
+    consent_latest = (
+        consent_candidates
+        .withColumn("rn_all", F.row_number().over(consent_rank))
+        .filter(F.col("rn_all") == 1)
+        .select("doc_join", "ley", "agree", "ts", "canal_contacto")
+    )
+
+    # ---- EXCLUSIÓN: si el consentimiento más reciente tiene agree=0, NO se incluye el cliente ----
+    consent_excluir = consent_latest.filter(F.col("agree") == 0).select("doc_join").distinct()
+    consent_permitidos = consent_latest.filter(F.col("agree") != 0).select("doc_join", "canal_contacto")
+
+    # ---- Clave en PN y depuración final ----
+    PN_df = (
+        PN_df
+        .withColumn("doc_join",
+            F.regexp_replace(F.col("IDENT").cast("string"), r"\s+", "")
+        )
+        .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
+    )
+
+    # 1) Eliminar clientes que NO permiten contacto según su consentimiento más reciente (1581 o 2300)
+    PN_dep = PN_df.join(consent_excluir, on="doc_join", how="left_anti")
+
+    # 2) Añadir el CANAL_DE_CONTACTO (según la ley ganadora por fecha)
+    PN_final = PN_dep.alias("pn").join(
+        consent_permitidos.alias("cs"),
+        on="doc_join", how="left"
+    )
+
+    # 3) Selección final (PN + canal de contacto)
+    df_final = (
+        PN_final
+        .select(
+            "pn.SEGMENTO",
+            F.col("pn.`TIPO DE DOCUMENTO`").alias("TIPO DE DOCUMENTO"),
+            "pn.IDENT",
+            "pn.CLIENTE",
+            "pn.CAPA",
+            F.col("pn.`CODIGO ZONAL`").alias("CODIGO ZONAL"),
+            F.col("pn.`CODIGO SAP GERENTE`").alias("CODIGO SAP GERENTE"),
+            "pn.NOMBRE_GERENTE",
+            "pn.PRODUCTO",
+            "pn.TELEFONOS",
+            "pn.DIRECCION",
+            "pn.CIUDAD",
+            F.col("cs.canal_contacto").alias("CANAL_DE_CONTACTO")
+        )
+    )
+
+    # -------------------------
+    # ESCRITURA S3
+    # -------------------------
+    now_str = datetime.now().strftime("%Y%m%d%H%M%S")
+    final_key = f"PN_LEYES_1581_2300_{now_str}.csv"
+    bucket = f"cdata-bocc-{var_env}-output"
+    prefix = "aplicaciones/apl_cdata/salida/qualtrics/"
+
+    (
+        df_final.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .option("sep", ",")
+        .option("encoding", "UTF-8")
+        .csv(f"s3://{bucket}/{prefix}{final_key}_tmp")
+    )
+    print(f"Archivo generado en s3://{bucket}/{prefix}{final_key}_tmp")
+
+    # -------------------------
+    # (Opcional) Validaciones rápidas
+    # -------------------------
+    try:
+        print("PN_base:", PN_base.count())
+        print("PN_enriched:", PN_enriched.count())
+        print("phones_raw:", phones_raw.count(), "phones_fmt:", phones_fmt.count())
+        print("classes_agg_client:", classes_agg_client.count())
+        print("PN_df (con doc_join previo a depurar):", PN_df.count())
+
+        print("MDM1581_latest:", MDM1581_latest.count())
+        print("LEY2300_latest:", LEY2300_latest.count())
+        print("consent_latest:", consent_latest.count())
+        print("consent_excluir:", consent_excluir.count())
+
+        print("Final:", df_final.count())
+        df_final.limit(10).show(truncate=False)
+    except Exception as e:
+        print(f"[WARN] Validaciones no ejecutadas: {e}")
