@@ -398,12 +398,13 @@ def job_qualtrics_test():
         return F.regexp_replace(F.trim(col), r"\s+", " ")
 
     def build_fullname(first_col, last_col, maiden_col):
-        full = collapse_spaces(F.concat_ws(" ",
-            F.coalesce(first, F.lit("")),
-            F.coalesce(last, F.lit("")),
-            F.coalesce(maiden, F.lit(""))
+        full = collapse_spaces(F.concat_ws(
+            " ",
+            F.coalesce(first_col,  F.lit("")),
+            F.coalesce(last_col,   F.lit("")),
+            F.coalesce(maiden_col, F.lit(""))
         ))
-        return proper_case(full)
+    return proper_case(full)
 
     def clean_city_desc(desc_col):
         cleaned = collapse_spaces(F.regexp_replace(desc_col, r"\.+\s*$", ""))
@@ -425,7 +426,7 @@ def job_qualtrics_test():
      
      
     # ───────────────────────────────────────────── 
-    # 1) FUNCIÓN PARA QUERY PN BASE LIGHT
+    # FASE 1 — PN_BASE_LIGHT
     # ─────────────────────────────────────────────
 
     def get_query_pn_base_light():
@@ -482,29 +483,10 @@ def job_qualtrics_test():
     # Ejecutar la lectura
     query_PN_BASE_LIGHT = get_query_pn_base_light()
     PN_base = leer_redshift(query_PN_BASE_LIGHT)
- 
+    print("Hasta Fase 1 OK")
 
     # ─────────────────────────────────────────────
-    # PHONES LIGHT
-    # ─────────────────────────────────────────────
-    query_PHONES_LIGHT = """
-        SELECT
-          p.CON_ID         AS ORG_ID,
-          p.ROW_ID         AS PHONE_ROW_ID,
-          p.X_OCS_PHONE_NUM,
-          p.X_OCS_EXTENSION,
-          p.X_OCS_END_DATE
-        FROM ADMSIEBEL.S_CON_PHONE p
-        WHERE p.X_OCS_END_DATE IS NULL
-    """.strip()
-    
-    phones_raw = leer_redshift(query_PHONES_LIGHT)
-    
-    print("phones_raw:", phones_raw.count())
-  
-    
-    # ─────────────────────────────────────────────
-    # LOVs
+    # FASE 2 — LOVs
     # ─────────────────────────────────────────────
 
     q_lov_multi = """
@@ -520,7 +502,7 @@ def job_qualtrics_test():
     AND ACTIVE_FLG = 'Y'
     """.strip()
 
-    lov_all = leer_redshift(q_lov_multi) \
+    lov_all = leer_redshift(q_lov_multi)
     .withColumnRenamed("NAME", "LOV_NAME") \
     .withColumnRenamed("VAL", "LOV_VAL") \
     .withColumnRenamed("HIGH", "LOV_HIGH") \
@@ -531,13 +513,32 @@ def job_qualtrics_test():
     lov_nid     = lov_all.filter(F.col("TYPE_NAME") == "OCS_NID_TYPES"                 ).select("LOV_NAME","LOV_HIGH")
     lov_segment = lov_all.filter(F.col("TYPE_NAME") == "OCS_SEGMENT"                   ).select("LOV_NAME","LOV_DESC")
     lov_city    = lov_all.filter(F.col("TYPE_NAME") == "OCS_CITY"                      ).select("LOV_VAL","LOV_DESC")
-    lov_prod    = lov_all.filter(F.col("TYPE_NAME") == "FINCORP_PROD_ADMIN_CLASS_MLOV").select("LOV_VAL","LOV_DESC")
+    lov_prod    = lov_all.filter(F.col("TYPE_NAME") == "FINCORP_PROD_ADMIN_CLASS_MLOV" ).select("LOV_VAL","LOV_DESC")
     lov_att     = lov_all.filter(F.col("TYPE_NAME") == "OCS_ATTENTION_TYPE"            ).select("LOV_NAME","LOV_DESC")
     print("lov_all:", lov_all.count())
+    print("Hasta Fase 2 OK")
     
     # ─────────────────────────────────────────────
-    # Enriquecimiento PN con LOVs y formatos
+    # FASE 3 — HELPERS FORMATO + ENRIQUECIMIENTO
     # ─────────────────────────────────────────────
+    print("\n[FASE 3] Helpers + PN_enriched...")
+    
+    # Helpers simples (igual SQL cliente)
+    def collapse_spaces(col):
+        return F.regexp_replace(F.trim(col), r"\s+", " ")
+    
+    def proper_case(col):
+        return F.concat(F.upper(F.substring(col, 1, 1)), F.lower(F.substring(col, 2, 4000)))
+    
+    def build_fullname(first_col, last_col, maiden_col):
+        full = F.concat_ws(" ", F.coalesce(first_col, F.lit("")), 
+                                 F.coalesce(last_col, F.lit("")), 
+                                 F.coalesce(maiden_col, F.lit("")))
+        return proper_case(collapse_spaces(full))
+    
+    def clean_city_desc(desc_col):
+        cleaned = F.regexp_replace(desc_col, r"\.+\s*$", "")
+        return proper_case(collapse_spaces(cleaned))
 
     PN_enriched = (  
     PN_base
@@ -579,7 +580,7 @@ def job_qualtrics_test():
             F.col("CLASE_PRODUCTO_VAL") == F.col("lv_prod.LOV_VAL"), 
             "left"
         )
-        .withColumn("CLASE_PRODUCTO_DESC", F.col("lv_prod.LOV_DESC
+        .withColumn("CLASE_PRODUCTO_DESC", F.col("lv_prod.LOV_DESC"))
 
 
         # Nombres formateados (cliente y gerente)
@@ -591,7 +592,7 @@ def job_qualtrics_test():
             "NOMBRE_GERENTE",
             build_fullname(F.col("G_FST_NAME"), F.col("G_LAST_NAME"), F.col("G_MAIDEN_NAME"))
 
-
+        )
         # Filtro de segmentos válidos (igual que tu SQL)
         .filter(F.col("SEGMENTO_COMERCIAL_CLIENTE").isin(
             'BP - Selecto','BP - Preferente Plus','BP - Elite Plus',
@@ -614,6 +615,31 @@ def job_qualtrics_test():
             "PR_PHONE_ID"
         )
     )
+    print("Hasta Fase 3 OK")
+
+    # ─────────────────────────────────────────────
+    # FASE 4 — PHONES LIGHT
+    # ─────────────────────────────────────────────
+    query_PHONES_LIGHT = """
+        SELECT
+          p.CON_ID         AS ORG_ID,
+          p.ROW_ID         AS PHONE_ROW_ID,
+          p.X_OCS_PHONE_NUM,
+          p.X_OCS_EXTENSION,
+          p.X_OCS_END_DATE
+        FROM ADMSIEBEL.S_CON_PHONE p
+        WHERE p.X_OCS_END_DATE IS NULL
+    """.strip()
+    
+    phones_raw = leer_redshift(query_PHONES_LIGHT)
+    print("phones_raw:", phones_raw.count())
+    print("Hasta Fase 4 OK")
+    job_qualtrics_test()
+    # ─────────────────────────────────────────────
+    # Enriquecimiento PN con LOVs y formatos
+    # ─────────────────────────────────────────────
+
+    
     
     # ─────────────────────────────────────────────
     # TELÉFONOS: agregación por cliente + LEFT JOIN (sin perder clientes)
