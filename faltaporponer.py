@@ -1,4 +1,21 @@
- # -------------------------
+lamada recursiva: job_qualtrics_test() está al final del archivo pero dentro del def, lo que dispara recursión infinita. (Mover afuera). [bancoccide...epoint.com]
+Uso de la función leer_redshift con firma equivocada en Fase 7 y 8 (le pasas 4 argumentos, pero está definida para 1). (Usar solo leer_redshift(query)). [bancoccide...epoint.com]
+Construcción de PN_with_doc: en Fase 9 calculas doc_join desde ROW_ID_CLIENTE, pero esa columna ya no existe en PN_df (la perdiste al seleccionar columnas “bonitas”). (Solución: o conservar ROW_ID_CLIENTE en PN_df, o calcular doc_join desde IDENT). [bancoccide...epoint.com]
+Operador <> en SQL escapado como \<\>** dentro del string** (no rompe Python, pero en Redshift debe ser <>). (Recomendación: reemplazar por <> para que la query sea exactamente la que esperas). [bancoccide...epoint.com]
+Uso de \> dentro de una expresión (en Fase 5). En el archivo se ve ... F.length(... ) \> 0. Ese backslash antes de > no tiene sentido en Python y puede causarte error de sintaxis dependiendo de cómo llegó el archivo. (Usar > 0 a secas).
+
+
+
+
+
+
+
+
+
+
+
+
+# -------------------------
     # CLASES_PRODUCTO (LISTAGG)
     # -------------------------
     classes_uniq = PN_enriched.dropDuplicates([
