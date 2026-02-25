@@ -522,24 +522,6 @@ def job_qualtrics_test():
     # FASE 3 — HELPERS FORMATO + ENRIQUECIMIENTO
     # ─────────────────────────────────────────────
     print("\n[FASE 3] Helpers + PN_enriched...")
-    
-    # Helpers simples (igual SQL cliente)
-    def collapse_spaces(col):
-        return F.regexp_replace(F.trim(col), r"\s+", " ")
-    
-    def proper_case(col):
-        return F.concat(F.upper(F.substring(col, 1, 1)), F.lower(F.substring(col, 2, 4000)))
-    
-    def build_fullname(first_col, last_col, maiden_col):
-        full = F.concat_ws(" ", F.coalesce(first_col, F.lit("")), 
-                                 F.coalesce(last_col, F.lit("")), 
-                                 F.coalesce(maiden_col, F.lit("")))
-        return proper_case(collapse_spaces(full))
-    
-    def clean_city_desc(desc_col):
-        cleaned = F.regexp_replace(desc_col, r"\.+\s*$", "")
-        return proper_case(collapse_spaces(cleaned))
-
     PN_enriched = (  
     PN_base
         # Tipo de documento: join por NAME → exponer HIGH
