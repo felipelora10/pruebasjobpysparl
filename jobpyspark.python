@@ -503,9 +503,9 @@ def job_qualtrics_test():
     """.strip()
 
     lov_all = leer_redshift(q_lov_multi)
-    .withColumnRenamed("NAME", "LOV_NAME") \
-    .withColumnRenamed("VAL", "LOV_VAL") \
-    .withColumnRenamed("HIGH", "LOV_HIGH") \
+    .withColumnRenamed("NAME", "LOV_NAME") 
+    .withColumnRenamed("VAL", "LOV_VAL") 
+    .withColumnRenamed("HIGH", "LOV_HIGH") 
     .withColumnRenamed("DESC_TEXT", "LOV_DESC")
 
 
@@ -630,39 +630,26 @@ def job_qualtrics_test():
         FROM ADMSIEBEL.S_CON_PHONE p
         WHERE p.X_OCS_END_DATE IS NULL
     """.strip()
-    
+
     phones_raw = leer_redshift(query_PHONES_LIGHT)
     print("phones_raw:", phones_raw.count())
     print("Hasta Fase 4 OK")
     job_qualtrics_test()
+    
     # ─────────────────────────────────────────────
-    # Enriquecimiento PN con LOVs y formatos
+    # FASE 5 TELÉFONOS: agregación por cliente + LEFT JOIN
     # ─────────────────────────────────────────────
 
-    
-    
-    # ─────────────────────────────────────────────
-    # TELÉFONOS: agregación por cliente + LEFT JOIN (sin perder clientes)
-    # ─────────────────────────────────────────────
-    ##PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
-    ##phones_raw  = phones_raw.repartition(120, "ORG_ID")
+    # Opcional repartition
+    # PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
+    # phones_raw  = phones_raw.repartition(120, "ORG_ID")
 
     phones_pre = (
         phones_raw.alias("p")
         .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
-        .withColumn("EXT_TRIM",       F.trim(F.col("p.X_OCS_EXTENSION")))
         .filter(F.col("PHONE_NUM_TRIM").isNotNull() & (F.length(F.col("PHONE_NUM_TRIM")) > 0))
-        .withColumn(
-            "PHONE_FORMAT",
-            F.concat(
-                F.col("PHONE_NUM_TRIM"),
-                F.when(
-                    F.col("EXT_TRIM").isNotNull() & (F.length(F.col("EXT_TRIM")) > 0), 
-                    F.concat(F.lit("|"), F.col("EXT_TRIM"))
-                ).otherwise(F.lit(""))
-            )
-        )
-        .withColumn("PHONE_ORDER", F.col("PHONE_NUM_TRIM")) 
+        .withColumn("PHONE_FORMAT", F.col("PHONE_NUM_TRIM"))
+        .withColumn("PHONE_ORDER", F.col("PHONE_NUM_TRIM"))
     )
 
     pn_keys = PN_enriched.select("ROW_ID_CLIENTE", "PR_PHONE_ID").distinct()
@@ -709,6 +696,9 @@ def job_qualtrics_test():
         )
         .drop("ORG_ID")
     )
+
+    print(f"[FASE 5] PN_with_phones: {PN_with_phones.count():,} registros")
+    print("Hasta Fase 5 OK")
     
     # -------------------------
     # CLASES_PRODUCTO (LISTAGG) 
