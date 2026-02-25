@@ -244,11 +244,7 @@ def job_qualtrics_test():
     # ─────────────────────────────────────────────
     # FASE 5 TELÉFONOS: agregación por cliente + LEFT JOIN
     # ─────────────────────────────────────────────
-
-    # Opcional repartition
-    # PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
-    # phones_raw  = phones_raw.repartition(120, "ORG_ID")
-
+    
     phones_pre = (
         phones_raw.alias("p")
         .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
@@ -368,7 +364,7 @@ def job_qualtrics_test():
         AND B.END_DT IS NULL AND CT.INACTIVATED_DT IS NULL AND G.END_DT IS NULL
     """.strip()
 
-    MDM1581 = leer_redshift(glueContext, connection_name, temp_dir, query_MDM1581)
+    MDM1581 = leer_redshift(query_MDM1581)
 
     MDM1581_latest = (
         MDM1581.withColumn("doc_join", F.regexp_replace(F.col("NUM_ID_CLIENTE").cast("string"), r"\\s+", ""))
@@ -409,7 +405,7 @@ def job_qualtrics_test():
     """.strip()  # Simplificado cols clave
 
     LEY2300_latest = (
-        leer_redshift(glueContext, connection_name, temp_dir, query_LEY2300)
+        leer_redshift(query_LEY2300)
         .withColumn("doc_join", F.regexp_replace(F.col("NUM_ID_CLIENTE").cast("string"), r"\\s+", ""))
         .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
         .withColumn("ts", F.coalesce(
@@ -450,7 +446,7 @@ def job_qualtrics_test():
 
     # Doc_join en PN_df (asumiendo ROW_ID_CLIENTE como ID cliente)
     PN_with_doc = PN_df.withColumn("doc_join",
-        F.regexp_replace(F.col("ROW_ID_CLIENTE").cast("string"), r"\\s+", "")
+        F.regexp_replace(F.col("IDENT").cast("string"), r"\\s+", "")
     ).withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
 
     # Exclude no-consent + add canal
@@ -464,7 +460,6 @@ def job_qualtrics_test():
         F.coalesce(F.col("cs.canal_contacto"), F.lit("N/A")).alias("CANAL_DE_CONTACTO")
     ).drop("doc_join")
 
-    print(f"[FASE 9] consent_latest: {consent_latest.count():,}, excluir: {consent_excluir.count():,}")
     print(f"[FASE 9] PN_final: {PN_final.count():,} registros")
 
     # Write CSV S3 (estilo simple)
