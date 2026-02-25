@@ -241,4 +241,113 @@ def job_qualtrics_test():
     print("phones_raw:", phones_raw.count())
     print("Hasta Fase 4 OK")
 
+    # ─────────────────────────────────────────────
+    # FASE 5 TELÉFONOS: agregación por cliente + LEFT JOIN
+    # ─────────────────────────────────────────────
+
+    # Opcional repartition
+    # PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
+    # phones_raw  = phones_raw.repartition(120, "ORG_ID")
+
+    phones_pre = (
+        phones_raw.alias("p")
+        .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
+        .filter(F.col("PHONE_NUM_TRIM").isNotNull() & (F.length(F.col("PHONE_NUM_TRIM")) > 0))
+        .withColumn("PHONE_FORMAT", F.col("PHONE_NUM_TRIM"))
+        .withColumn("PHONE_ORDER", F.col("PHONE_NUM_TRIM"))
+    )
+
+    pn_keys = PN_enriched.select("ROW_ID_CLIENTE", "PR_PHONE_ID").distinct()
+    pn_keys = broadcast(pn_keys)
+
+    phones_labeled = (
+        phones_pre.alias("p")
+        .join(
+            pn_keys.alias("c"),
+            F.col("p.ORG_ID") == F.col("c.ROW_ID_CLIENTE"),
+            "left"
+        )
+        .withColumn(
+            "PHONE_FORMAT",
+            F.when(
+                F.col("p.PHONE_ROW_ID") == F.col("c.PR_PHONE_ID"),
+                F.concat(F.lit("P-"), F.col("PHONE_FORMAT"))
+            ).otherwise(F.col("PHONE_FORMAT"))
+        )
+    )
+
+    phones_agg = (
+        phones_labeled
+        .groupBy("ORG_ID")
+        .agg(
+            F.expr("""
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('k', PHONE_ORDER, 'v', PHONE_FORMAT))),
+                        x -> x.v
+                    ),
+                    ', '
+                )
+            """).alias("TELEFONOS")
+        )
+    )
+
+    PN_with_phones = (
+        PN_enriched.alias("pn")
+        .join(
+            phones_agg.alias("ph"),
+            F.col("pn.ROW_ID_CLIENTE") == F.col("ph.ORG_ID"),
+            "left"
+        )
+        .drop("ORG_ID")
+    )
+
+    print(f"[FASE 5] PN_with_phones: {PN_with_phones.count():,} registros")
+    print("Hasta Fase 5 OK")
+
+    # ─────────────────────────────────────────────
+    # FASE 6: Classes agg + Final DF
+    # ─────────────────────────────────────────────
+    
+    classes_uniq = PN_enriched.dropDuplicates([
+        "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+        "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+        "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD","CLASE_PRODUCTO"  # ✅ Mantiene multiples clases
+    ])
+
+    classes_agg_client = (
+        classes_uniq.groupBy(
+            "ROW_ID_CLIENTE","TIPO_DE_DOCUMENTO_COD","NUMERO_DE_DOCUMENTO","NOMBRE_CLIENTE",
+            "COD_DIVISION_GERENTE","NOMBRE_GERENTE","CODIGO_SAP_GERENTE",
+            "SEGMENTO","TIPO_ATENCION","DIRECCION","CIUDAD"
+        ).agg(
+            F.array_join(
+                F.array_sort(F.array_distinct(F.collect_list("CLASE_PRODUCTO"))),
+                ", "
+            ).alias("CLASES_PRODUCTO")
+        )
+    )
+
+    PN_df = (
+        classes_agg_client.alias("c")
+        .join(phones_agg.alias("p"), F.col("c.ROW_ID_CLIENTE") == F.col("p.ORG_ID"), "left")
+        .select(
+            F.col("c.SEGMENTO").alias("SEGMENTO"),
+            F.col("c.TIPO_DE_DOCUMENTO_COD").alias("TIPO DE DOCUMENTO"),
+            F.col("c.NUMERO_DE_DOCUMENTO").alias("IDENT"),
+            F.col("c.NOMBRE_CLIENTE").alias("CLIENTE"),
+            F.col("c.TIPO_ATENCION").alias("CAPA"),
+            F.col("c.COD_DIVISION_GERENTE").alias("CODIGO ZONAL"),
+            F.col("c.CODIGO_SAP_GERENTE").alias("CODIGO SAP GERENTE"),
+            F.col("c.NOMBRE_GERENTE").alias("NOMBRE_GERENTE"),
+            F.col("c.CLASES_PRODUCTO").alias("PRODUCTO"),
+            F.coalesce(F.col("p.TELEFONOS"), F.lit("N/A")).alias("TELEFONOS"),  # ✅ Null-safe
+            F.col("c.DIRECCION").alias("DIRECCION"),
+            F.col("c.CIUDAD").alias("CIUDAD")
+        ).orderBy("CLIENTE")
+    )
+
+    print(f"Final rows: {PN_df.count():,}")
+    print("Hasta Fase 6 OK")
+
     job_qualtrics_test()
