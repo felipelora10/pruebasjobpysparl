@@ -244,7 +244,11 @@ def job_qualtrics_test():
     # ─────────────────────────────────────────────
     # FASE 5 TELÉFONOS: agregación por cliente + LEFT JOIN
     # ─────────────────────────────────────────────
-    
+
+    # Opcional repartition
+    # PN_enriched = PN_enriched.repartition(120, "ROW_ID_CLIENTE")
+    # phones_raw  = phones_raw.repartition(120, "ORG_ID")
+
     phones_pre = (
         phones_raw.alias("p")
         .withColumn("PHONE_NUM_TRIM", F.trim(F.col("p.X_OCS_PHONE_NUM")))
@@ -347,129 +351,190 @@ def job_qualtrics_test():
     print("Hasta Fase 6 OK")
 
     # ─────────────────────────────────────────────
-    # FASE 7: LEY 1581 - Lectura + Latest por Doc
+    # FASE 7 — Ley 1581: último por cliente + gate {1,2}
     # ─────────────────────────────────────────────
-
     query_MDM1581 = """
-        SELECT V.CONTENT AS CONTACTO, G.REF_NUM AS NUM_ID_CLIENTE, B.AGREE_IND, B.CREATE_DATE AS FECHA_DILIG
-        FROM ADMMDM.CONTACT CT INNER JOIN ADMMDM.IDENTIFIER G ON CT.CONT_ID = G.CONT_ID
-        INNER JOIN ADMMDM.CONSENT B ON B.CONSENT_OWNER_ID = G.CONT_ID
-        INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON B.PROC_PURP_ID = P.PROC_PURP_ID
-        INNER JOIN ADMMDM.CONSENTREGULATION CR ON B.PROC_PURP_ID = CR.PROC_PURP_ID 
-        INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON B.PROC_PURP_ID = PA.PROC_PURP_ID
-        INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON B.PROC_PURP_ID = PPTA.PROC_PURP_ID
-        LEFT JOIN ADMMDM.CONSENTPROVISION V ON B.CONSENT_ID = V.CONSENT_ID
-        WHERE P.PROC_PURP_TP_CD = '1000002' AND REGULATION_TP_CD = '1000001'
-        AND PROC_ACT_TP_CD = '1000001' AND TENANT_TP_CD = '1000007'
-        AND B.END_DT IS NULL AND CT.INACTIVATED_DT IS NULL AND G.END_DT IS NULL
+    SELECT V.CONTENT AS CONTACTO, G.REF_NUM AS NUM_ID_CLIENTE, B.AGREE_IND, B.CREATE_DATE AS FECHA_DILIG
+    FROM ADMMDM.CONTACT CT INNER JOIN ADMMDM.IDENTIFIER G ON CT.CONT_ID = G.CONT_ID
+    INNER JOIN ADMMDM.CONSENT B ON B.CONSENT_OWNER_ID = G.CONT_ID
+    INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON B.PROC_PURP_ID = P.PROC_PURP_ID
+    INNER JOIN ADMMDM.CONSENTREGULATION CR ON B.PROC_PURP_ID = CR.PROC_PURP_ID
+    INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON B.PROC_PURP_ID = PA.PROC_PURP_ID
+    INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON B.PROC_PURP_ID = PPTA.PROC_PURP_ID
+    LEFT JOIN ADMMDM.CONSENTPROVISION V ON B.CONSENT_ID = V.CONSENT_ID
+    WHERE P.PROC_PURP_TP_CD = '1000002' AND REGULATION_TP_CD = '1000001'
+    AND PROC_ACT_TP_CD = '1000001' AND TENANT_TP_CD = '1000007'
+    AND B.END_DT IS NULL AND CT.INACTIVATED_DT IS NULL AND G.END_DT IS NULL
     """.strip()
 
     MDM1581 = leer_redshift(query_MDM1581)
 
+    # Normalizador de documento (quita espacios y ceros a la izquierda)
+    def _norm_doc(col):
+        return F.regexp_replace(F.regexp_replace(F.col(col).cast("string"), r"\s+", ""), r"^0+", "")
+
     MDM1581_latest = (
-        MDM1581.withColumn("doc_join", F.regexp_replace(F.col("NUM_ID_CLIENTE").cast("string"), r"\\s+", ""))
-        .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
-        .withColumn("ts", F.coalesce(
-            F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "dd/MM/yy hh:mm:ss,SSSSSSSSS a"),
-            F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "dd/MM/yy hh:mm:ss a"),
-            F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "yyyy-MM-dd HH:mm:ss"),
-            F.to_timestamp(F.col("FECHA_DILIG"))
-        ))
-        .withColumn("agree", F.when(F.col("AGREE_IND").cast("int") == 0, 0).otherwise(1))
-        .withColumn("rn", F.row_number().over(Window.partitionBy("doc_join").orderBy(F.col("ts").desc_nulls_last())))
-        .filter(F.col("rn") == 1)
-        .select(F.lit("1581").alias("ley"), "doc_join", "agree", "ts", F.col("CONTACTO").alias("canal_contacto"))
-        .drop("rn")
-    )
-
-    print(f"[FASE 7] 1581_latest: {MDM1581_latest.count():,} consents")
-    print("Fase 7 OK")
-
-    # ─────────────────────────────────────────────
-    # FASE 8: LEY 2300 - Lectura + Latest por Doc
-    # ─────────────────────────────────────────────
-
-    query_LEY2300 = """
-        SELECT I.REF_NUM AS NUM_ID_CLIENTE, C.CREATE_DATE AS FECHA_DE_INICIO, C.AGREE_IND,
-            NVL(V.CONTENT,'-') AS CANAL_DE_CONTACTO
-        FROM ADMMDM.CONTACT CT INNER JOIN ADMMDM.IDENTIFIER I ON CT.CONT_ID = I.CONT_ID
-        INNER JOIN ADMMDM.CONSENT C ON I.CONT_ID = C.CONSENT_OWNER_ID
-        INNER JOIN ADMMDM.CONSENTPROVISION V ON C.CONSENT_ID = V.CONSENT_ID
-        INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON C.PROC_PURP_ID = P.PROC_PURP_ID
-        INNER JOIN ADMMDM.CONSENTREGULATION CR ON C.PROC_PURP_ID = CR.PROC_PURP_ID 
-        INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON C.PROC_PURP_ID = PA.PROC_PURP_ID
-        INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON C.PROC_PURP_ID = PPTA.PROC_PURP_ID
-        WHERE P.PROC_PURP_TP_CD = '1000002' AND REGULATION_TP_CD = '1000003'
-        AND PROC_ACT_TP_CD = '1000001' AND TENANT_TP_CD = '1000007'
-        AND C.END_DT IS NULL AND CT.INACTIVATED_DT IS NULL AND I.END_DT IS NULL
-    """.strip()  # Simplificado cols clave
-
-    LEY2300_latest = (
-        leer_redshift(query_LEY2300)
-        .withColumn("doc_join", F.regexp_replace(F.col("NUM_ID_CLIENTE").cast("string"), r"\\s+", ""))
-        .withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
-        .withColumn("ts", F.coalesce(
-            F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "dd/MM/yy hh:mm:ss,SSSSSSSSS a"),
-            F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "dd/MM/yy hh:mm:ss a"),
-            F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "yyyy-MM-dd HH:mm:ss"),
-            F.to_timestamp(F.col("FECHA_DE_INICIO"))
-        ))
-        .withColumn("agree", F.when(F.trim(F.col("AGREE_IND")) == "0", 0)
-                        .when(F.trim(F.col("AGREE_IND")) == "1", 1)
-                        .otherwise(F.col("AGREE_IND").cast("int")))
-        .withColumn("rn", F.row_number().over(Window.partitionBy("doc_join").orderBy(F.col("ts").desc_nulls_last())))
-        .filter(F.col("rn") == 1)
-        .select(F.lit("2300").alias("ley"), "doc_join", "agree", "ts", F.col("CANAL_DE_CONTACTO").alias("canal_contacto"))
-        .drop("rn")
-    )
-
-    print(f"[FASE 8] 2300_latest: {LEY2300_latest.count():,} consents")
-    print("Fase 8 OK")
-
-    # ─────────────────────────────────────────────
-    # FASE 9: Union Leyes + Latest + Filter + Join + Write
-    # ─────────────────────────────────────────────
-
-    consent_candidates = MDM1581_latest.unionByName(LEY2300_latest)
-
-    consent_latest = (
-        consent_candidates.withColumn("rn_all", F.row_number().over(
-            Window.partitionBy("doc_join").orderBy(
-                F.col("ts").desc_nulls_last(),
-                F.when(F.col("ley") == "2300", 1).otherwise(0).desc()
+        MDM1581
+        .withColumn("doc_join", _norm_doc("NUM_ID_CLIENTE"))
+        .withColumn(
+            "ts",
+            F.coalesce(
+                F.to_timestamp(F.col("FECHA_DILIG")),
+                F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "yyyy-MM-dd HH:mm:ss.SSS"),
+                F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "yyyy-MM-dd HH:mm:ss.SSSSSS"),
+                F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "yyyy-MM-dd HH:mm:ss"),
+                F.to_timestamp(F.col("FECHA_DILIG").cast("string"), "dd/MM/yy hh:mm:ss a")
             )
-        )).filter(F.col("rn_all") == 1).select("doc_join", "ley", "agree", "ts", "canal_contacto")
+        )
+        .withColumn("rn", F.row_number().over(
+            Window.partitionBy("doc_join").orderBy(F.col("ts").desc_nulls_last())
+        ))
+        .filter(F.col("rn") == 1)                       # ⇦ ÚLTIMO por cliente
+        .filter(F.col("AGREE_IND").cast("int").isin(1,2))  # ⇦ GATE: mantener {1,2}
+        .select("doc_join")                            # ⇦ set de clientes habilitados por 1581
     )
 
-    consent_excluir = consent_latest.filter(F.col("agree") == 0).select("doc_join").distinct()
-    consent_ok = consent_latest.filter(F.col("agree") != 0).select("doc_join", "canal_contacto")
+    print(f"Final rows: {MDM1581_latest.count():,}")
+    print("Hasta Fase 7 OK")
 
-    # Doc_join en PN_df (asumiendo ROW_ID_CLIENTE como ID cliente)
-    PN_with_doc = PN_df.withColumn("doc_join",
-        F.regexp_replace(F.col("IDENT").cast("string"), r"\\s+", "")
-    ).withColumn("doc_join", F.regexp_replace(F.col("doc_join"), r"^0+", ""))
+    # ─────────────────────────────────────────────
+    # FASE 8 — Ley 2300 (Formulario + RNE): último por cliente
+    # ─────────────────────────────────────────────
 
-    # Exclude no-consent + add canal
-    PN_filtered = PN_with_doc.join(consent_excluir, on="doc_join", how="left_anti")
-    PN_final = PN_filtered.alias("pn").join(
-        consent_ok.alias("cs"), on="doc_join", how="left"
-    ).select(
-        "SEGMENTO", F.col("`TIPO DE DOCUMENTO`"), "IDENT", "CLIENTE", "CAPA",
-        F.col("`CODIGO ZONAL`"), F.col("`CODIGO SAP GERENTE`"), "NOMBRE_GERENTE",
-        "PRODUCTO", "TELEFONOS", "DIRECCION", "CIUDAD",
-        F.coalesce(F.col("cs.canal_contacto"), F.lit("N/A")).alias("CANAL_DE_CONTACTO")
-    ).drop("doc_join")
+    # 8.1 — 2300 FORMULARIO (tu query actual)
+    query_LEY2300 = """
+    SELECT I.REF_NUM AS NUM_ID_CLIENTE, C.CREATE_DATE AS FECHA_DE_INICIO, C.AGREE_IND,
+            NVL(V.CONTENT,'-') AS CANAL_DE_CONTACTO
+    FROM ADMMDM.CONTACT CT INNER JOIN ADMMDM.IDENTIFIER I ON CT.CONT_ID = I.CONT_ID
+    INNER JOIN ADMMDM.CONSENT C ON I.CONT_ID = C.CONSENT_OWNER_ID
+    INNER JOIN ADMMDM.CONSENTPROVISION V ON C.CONSENT_ID = V.CONSENT_ID
+    INNER JOIN ADMMDM.PROCESSINGPURPOSE P ON C.PROC_PURP_ID = P.PROC_PURP_ID
+    INNER JOIN ADMMDM.CONSENTREGULATION CR ON C.PROC_PURP_ID = CR.PROC_PURP_ID 
+    INNER JOIN ADMMDM.PROCESSINGACTIVITY PA ON C.PROC_PURP_ID = PA.PROC_PURP_ID
+    INNER JOIN ADMMDM.PROCPURPTENANTASSOC PPTA ON C.PROC_PURP_ID = PPTA.PROC_PURP_ID
+    WHERE P.PROC_PURP_TP_CD = '1000002' AND REGULATION_TP_CD = '1000003'
+    AND PROC_ACT_TP_CD = '1000001' AND TENANT_TP_CD = '1000007'
+    AND C.END_DT IS NULL AND CT.INACTIVATED_DT IS NULL AND I.END_DT IS NULL
+    """.strip()
+
+    LEY2300_form = (
+        leer_redshift(query_LEY2300)
+        .withColumn("doc_join", _norm_doc("NUM_ID_CLIENTE"))
+        .withColumn(
+            "ts",
+            F.coalesce(
+                F.to_timestamp(F.col("FECHA_DE_INICIO")),
+                F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "yyyy-MM-dd HH:mm:ss.SSS"),
+                F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "yyyy-MM-dd HH:mm:ss"),
+                F.to_timestamp(F.col("FECHA_DE_INICIO").cast("string"), "dd/MM/yy hh:mm:ss a")
+            )
+        )
+        .select(
+            F.lit("2300_FORM").alias("fuente"),
+            "doc_join",
+            "ts",
+            F.col("CANAL_DE_CONTACTO").alias("canal_form")     # ⇦ usar SOLO si Form es el último
+        )
+    )
+
+    # 8.2 — 2300 RNE (query convertido a Redshift)
+    query_RNE_2300 = """
+    SELECT
+    I.REF_NUM                 AS IDENTIFICATION_NUMBER,
+    C.AGREE_IND               AS AGREE_IND,
+    V.CONTENT                 AS CONTENT,
+    CEA.ENTITY_ATTRIBUTE_NAME AS ENTITY_ATTRIBUTE_NAME,
+    C.CREATE_DATE             AS CREATE_DATE
+    FROM ADMMDM.CONTACT CT
+    JOIN ADMMDM.IDENTIFIER I               ON CT.CONT_ID = I.CONT_ID
+    JOIN ADMMDM.CONSENT C                  ON I.CONT_ID = C.CONSENT_OWNER_ID
+    JOIN ADMMDM.CONSENTPROVISION V         ON C.CONSENT_ID = V.CONSENT_ID
+    JOIN ADMMDM.PROCESSINGPURPOSE P        ON C.PROC_PURP_ID = P.PROC_PURP_ID
+    JOIN ADMMDM.PROCPURPTENANTASSOC PPTA   ON C.PROC_PURP_ID = PPTA.PROC_PURP_ID
+    JOIN ADMMDM.CONSENTENTITYASSOC CEA     ON C.CONSENT_ID = CEA.CONSENT_ID
+    JOIN ADMMDM.CONSENTREGULATION CR       ON C.PROC_PURP_ID = CR.PROC_PURP_ID
+    JOIN ADMMDM.PROCESSINGACTIVITY PA      ON C.PROC_PURP_ID = PA.PROC_PURP_ID
+    WHERE
+    P.PROC_PURP_TP_CD = 1000002
+    AND CR.REGULATION_TP_CD = 1000003
+    AND PPTA.TENANT_TP_CD  IN (1000009,1000010)
+    AND PA.PROC_ACT_TP_CD  IN (1000002,1000003,1000004,1000005)
+    AND C.END_DT IS NULL
+    AND CT.INACTIVATED_DT IS NULL
+    AND I.END_DT IS NULL
+    """.strip()
+
+    LEY2300_rne = (
+        leer_redshift(query_RNE_2300)
+        .withColumn("doc_join", _norm_doc("IDENTIFICATION_NUMBER"))
+        .withColumn("ts", F.col("CREATE_DATE").cast("timestamp"))     # ⇦ comparar usando CreateDate
+        .select(
+            F.lit("2300_RNE").alias("fuente"),
+            "doc_join",
+            "ts",
+            F.col("CONTENT").alias("content_rne")                     # ⇦ usar SOLO si RNE es el último
+        )
+    )
+
+    # 8.3 — Unir FORM + RNE y quedarnos con el más reciente por doc
+    LEY2300_union = LEY2300_form.unionByName(LEY2300_rne, allowMissingColumns=True)
+
+    prefer_rne = F.when(F.col("fuente") == "2300_RNE", 2).otherwise(1)  # empate → prioriza RNE
+    LEY2300_latest = (
+        LEY2300_union
+        .withColumn("rn", F.row_number().over(
+            Window.partitionBy("doc_join").orderBy(F.col("ts").desc_nulls_last(), prefer_rne.desc())
+        ))
+        .filter(F.col("rn") == 1)
+        .select(
+            "doc_join",
+            "fuente",
+            F.when(F.col("fuente") == "2300_FORM", F.col("canal_form")).alias("CANAL_DE_CONTACTO"),
+            F.when(F.col("fuente") == "2300_RNE",  F.col("content_rne")).alias("CONTENT")
+        )
+    )
+
+    print(f"Final rows FORMULARIO: {LEY2300_form.count():,}")
+    print(f"Final rows RNE: {LEY2300_rne.count():,}")
+    print("Hasta Fase 8 OK")
+
+    # ─────────────────────────────────────────────
+    # FASE 9 — Aplicar gate 1581 y unir canal 2300 al PN
+    # ─────────────────────────────────────────────
+
+    # 9.1 — PN con doc normalizado (desde IDENT)
+    PN_with_doc = PN_df.withColumn(
+        "doc_join",
+        F.regexp_replace(F.regexp_replace(F.col("IDENT").cast("string"), r"\s+", ""), r"^0+", "")
+    )
+
+    # 9.2 — Gate 1581 (inner con los habilitados {1,2})
+    PN_1581_ok = PN_with_doc.join(MDM1581_latest, on="doc_join", how="inner")
+
+    # 9.3 — Traer último 2300 y exponer solo el campo de la fuente ganadora
+    PN_final = (
+        PN_1581_ok.alias("pn")
+        .join(LEY2300_latest.alias("c2300"), on="doc_join", how="left")
+        .select(
+            "pn.SEGMENTO", F.col("pn.`TIPO DE DOCUMENTO`"), "pn.IDENT", "pn.CLIENTE", "pn.CAPA",
+            F.col("pn.`CODIGO ZONAL`"), F.col("pn.`CODIGO SAP GERENTE`"), "pn.NOMBRE_GERENTE",
+            "pn.PRODUCTO", "pn.TELEFONOS", "pn.DIRECCION", "pn.CIUDAD",
+            F.when(F.col("c2300.fuente") == "2300_FORM", F.col("c2300.CANAL_DE_CONTACTO"))
+            .when(F.col("c2300.fuente") == "2300_RNE",  F.col("c2300.CONTENT"))
+            .otherwise(F.lit("N/A")).alias("CANAL_CONTACTO_FINAL")
+            # (si quieres para QA): , F.col("c2300.fuente").alias("FUENTE_2300")
+        )
+    )
 
     print(f"[FASE 9] PN_final: {PN_final.count():,} registros")
+    print("TODO OK")
 
-    # Write CSV S3 (estilo simple)
+    # (Tu escritura a S3 puede quedarse igual)
     from datetime import datetime
     now_str = datetime.now().strftime("%Y%m%d%H%M%S")
     output_path = f"{temp_dir}PN_LEYES_1581_2300_{now_str}/"
     PN_final.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
     print(f"✅ Escrito en: {output_path}")
-
     PN_final.limit(10).show(truncate=False)
-    print("Job completo OK")
 
     job_qualtrics_test()
